@@ -80,6 +80,29 @@ def parse_json(json_path, db_path):
         data = json.load(f)
 
     for hand in data.get('hands', []):
+        # 1. Standard Play Filter
+        if hand.get('gameType', 'th') != 'th':
+            continue
+        if hand.get('bombPot', False):
+            continue
+        if len(hand.get('players', [])) < 6:
+            continue
+        if hand.get('straddleSeat') is not None:
+            continue
+
+        # 'Walk' Hands: Any hand where the only pre-flop actions are 'Folds' or 'Checks' by the blinds.
+        is_walk_hand = True
+        for event in hand.get('events', []):
+            evt_type = event.get('payload', {}).get('type')
+            if evt_type == 9:  # Board dealt (flop reached)
+                break
+            if evt_type in [7, 8]:  # 7 = Call, 8 = Raise
+                is_walk_hand = False
+                break
+
+        if is_walk_hand:
+            continue
+
         hand_id = hand['id']
         started_at = datetime.fromtimestamp(hand['startedAt'] / 1000).isoformat()
         is_cents = hand.get('cents', False)
