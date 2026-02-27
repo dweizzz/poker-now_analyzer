@@ -57,6 +57,14 @@ view_mode = st.sidebar.radio("Select View", ["Exploit Dashboard", "Player Profil
 if view_mode == "Exploit Dashboard":
     st.header("Opponent Intelligence & Exploit Dashboard")
 
+    st.info("""
+    **Statistic Definitions:**
+    * **WTSD% (Went to Showdown):** Percentage of times a player goes to showdown after seeing the flop. (Optimal ~25-30%)
+    * **WSD% (Won Money at Showdown):** Percentage of times a player wins the pot when they go to showdown. (Optimal >50%)
+    * **WWSF% (Won When Saw Flop):** Percentage of hands won after seeing the flop. (Optimal ~45-50%)
+    * **River Bluff%:** Percentage of times a player bet or raised on the river, got called, and lost the hand.
+    """)
+
     st.subheader("Target List")
     targets_df = analytics.get_exploit_targets()
     if not targets_df.empty:
