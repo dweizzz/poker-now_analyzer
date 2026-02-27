@@ -91,28 +91,7 @@ if view_mode == "Exploit Dashboard":
     else:
         st.info("No sufficient data for Target List (requires >= 50 hands per player).")
 
-    st.divider()
 
-    st.subheader("Hero Leak Finder")
-    hero_leaks = analytics.get_hero_leaks()
-    if hero_leaks:
-        hero = hero_leaks["stats"]
-        leaks = hero_leaks["leaks"]
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Hero WTSD%", f"{hero['wtsd_pct']}%")
-        col2.metric("Hero WSD%", f"{hero['wsd_pct']}%")
-        col3.metric("Hero WWSF%", f"{hero['wwsf_pct']}%")
-        col4.metric("Hero River Bluff%", f"{hero['river_bluff_freq']}%")
-
-        st.write("### Analysis")
-        for leak in leaks:
-            if "Optimal" in leak and not "solid" in leak.lower():
-                st.warning(leak)
-            else:
-                st.success(leak)
-    else:
-        st.info("No data for Hero ID 'EJd9KHwjJa'.")
 
 elif view_mode == "Net PnL Leaderboard":
     st.header("Net PnL Leaderboard")
