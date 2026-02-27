@@ -52,6 +52,23 @@ def init_db(db_path):
     )
     ''')
 
+    # Player Priors table (New table for long-term opponent intelligence)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS player_priors (
+        player_id TEXT PRIMARY KEY,
+        total_hands INTEGER,
+        vpip_pct REAL,
+        pfr_pct REAL,
+        three_bet_pct REAL,
+        wtsd_pct REAL,
+        wsd_pct REAL,
+        wwsf_pct REAL,
+        river_bluff_freq REAL,
+        avg_showdown_strength REAL,
+        profile_tag TEXT
+    )
+    ''')
+
     conn.commit()
     return conn
 
@@ -155,11 +172,14 @@ def parse_json(json_path, db_path):
                 turn = payload.get('turn')
                 if turn == 1:
                     stage = "Flop"
+                    action = 'deal_flop'
                 elif turn == 2:
                     stage = "Turn"
+                    action = 'deal_turn'
                 elif turn == 3:
                     stage = "River"
-                continue # Do not track dealer actions as player actions
+                    action = 'deal_river'
+                player_id = 'Dealer'
             else:
                 action = 'other'
 

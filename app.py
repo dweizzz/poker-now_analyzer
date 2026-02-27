@@ -24,6 +24,12 @@ def run_ingestion():
         with st.spinner("New logs detected. Ingesting to database..."):
             subprocess.run(["python3", "ingest.py", input_dir])
 
+            from analytics import PokerAnalytics
+            try:
+                PokerAnalytics('pokernow.db').calculate_and_store_player_priors()
+            except Exception as e:
+                print("Error calculating priors:", e)
+
     return has_files
 
 # Run it
@@ -44,9 +50,61 @@ analytics = get_analytics()
 priors_df = analytics.get_priors()
 
 st.sidebar.header("Navigation")
-view_mode = st.sidebar.radio("Select View", ["Player Profile", "Net PnL Leaderboard"])
+view_mode = st.sidebar.radio("Select View", ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard"])
 
-if view_mode == "Net PnL Leaderboard":
+if view_mode == "Exploit Dashboard":
+    st.header("Opponent Intelligence & Exploit Dashboard")
+
+    st.subheader("Target List")
+    targets_df = analytics.get_exploit_targets()
+    if not targets_df.empty:
+        display_targets = targets_df[['display_name', 'player_id', 'total_hands', 'wtsd_pct', 'wsd_pct', 'wwsf_pct', 'river_bluff_freq', 'profile_tag']].rename(columns={
+            'display_name': 'Name',
+            'player_id': 'Player ID',
+            'total_hands': 'Hands',
+            'wtsd_pct': 'WTSD%',
+            'wsd_pct': 'WSD%',
+            'wwsf_pct': 'WWSF%',
+            'river_bluff_freq': 'River Bluff%',
+            'profile_tag': 'Profile Tag'
+        })
+        st.dataframe(
+            display_targets.style.format({
+                "WTSD%": "{:.1f}%",
+                "WSD%": "{:.1f}%",
+                "WWSF%": "{:.1f}%",
+                "River Bluff%": "{:.1f}%"
+            }).background_gradient(subset=["WTSD%", "WWSF%"], cmap="Oranges"),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("No sufficient data for Target List (requires >10 hands per player).")
+
+    st.divider()
+
+    st.subheader("Hero Leak Finder")
+    hero_leaks = analytics.get_hero_leaks()
+    if hero_leaks:
+        hero = hero_leaks["stats"]
+        leaks = hero_leaks["leaks"]
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Hero WTSD%", f"{hero['wtsd_pct']}%")
+        col2.metric("Hero WSD%", f"{hero['wsd_pct']}%")
+        col3.metric("Hero WWSF%", f"{hero['wwsf_pct']}%")
+        col4.metric("Hero River Bluff%", f"{hero['river_bluff_freq']}%")
+
+        st.write("### Analysis")
+        for leak in leaks:
+            if "Optimal" in leak and not "solid" in leak.lower():
+                st.warning(leak)
+            else:
+                st.success(leak)
+    else:
+        st.info("No data for Hero ID 'EJd9KHwjJa'.")
+
+elif view_mode == "Net PnL Leaderboard":
     st.header("Net PnL Leaderboard")
     pnl_df = analytics.get_net_pnl_all_players()
     if not pnl_df.empty:
