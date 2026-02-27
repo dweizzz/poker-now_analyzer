@@ -291,8 +291,26 @@ class TestAnalytics(unittest.TestCase):
 
     def test_get_exploit_targets(self):
         self.analytics.calculate_and_store_player_priors()
+
+        # Insert dummy players with >= 50 hands since the mock DB only has ~4 hands
+        self.cursor.execute("INSERT INTO players (player_id, player_name) VALUES ('dummy1', 'Dummy One')")
+        self.cursor.execute("INSERT INTO players (player_id, player_name) VALUES ('dummy2', 'Dummy Two')")
+        self.cursor.execute('''
+            INSERT INTO player_priors
+            (player_id, total_hands, vpip_pct, pfr_pct, three_bet_pct, wtsd_pct, wsd_pct, wwsf_pct, river_bluff_freq, avg_showdown_strength, profile_tag)
+            VALUES ('dummy1', 50, 20.0, 15.0, 5.0, 30.0, 50.0, 45.0, 10.0, 2.5, 'Regular')
+        ''')
+        self.cursor.execute('''
+            INSERT INTO player_priors
+            (player_id, total_hands, vpip_pct, pfr_pct, three_bet_pct, wtsd_pct, wsd_pct, wwsf_pct, river_bluff_freq, avg_showdown_strength, profile_tag)
+            VALUES ('dummy2', 60, 20.0, 15.0, 5.0, 40.0, 50.0, 45.0, 10.0, 2.5, 'Regular')
+        ''')
+        self.conn.commit()
+
         df = self.analytics.get_exploit_targets()
         self.assertFalse(df.empty)
+        self.assertEqual(len(df), 2) # Should only return dummy1 and dummy2
+
         self.assertIn('wtsd_pct', df.columns)
         self.assertIn('pfr_pct', df.columns)
         # Check sort order by wtsd_pct DESC

@@ -591,7 +591,7 @@ class PokerAnalytics:
             SELECT player_id, player_name, ROW_NUMBER() OVER(PARTITION BY player_id ORDER BY COUNT(*) DESC) as rn
             FROM players GROUP BY player_id, player_name
         ) p ON pp.player_id = p.player_id AND p.rn = 1
-        -- WHERE pp.total_hands > 10 (omitted for MVP to show everyone)
+        WHERE pp.total_hands >= 50
         ORDER BY pp.wtsd_pct DESC
         """
         try:

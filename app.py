@@ -48,6 +48,8 @@ def get_analytics():
 analytics = get_analytics()
 
 priors_df = analytics.get_priors()
+if not priors_df.empty:
+    priors_df = priors_df[priors_df['total_hands'] >= 50]
 
 st.sidebar.header("Navigation")
 view_mode = st.sidebar.radio("Select View", ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard"])
@@ -79,7 +81,7 @@ if view_mode == "Exploit Dashboard":
             hide_index=True
         )
     else:
-        st.info("No sufficient data for Target List (requires >10 hands per player).")
+        st.info("No sufficient data for Target List (requires >= 50 hands per player).")
 
     st.divider()
 
