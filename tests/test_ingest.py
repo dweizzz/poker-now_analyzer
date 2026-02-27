@@ -29,6 +29,7 @@ class TestIngest(unittest.TestCase):
             'player_hand_cards',
             'events',
             'player_priors',
+            'processed_games',
             'sqlite_sequence' # Auto-created for AUTOINCREMENT
         ]
 

@@ -69,6 +69,14 @@ def init_db(db_path):
     )
     ''')
 
+    # Processed Games table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS processed_games (
+        game_id TEXT PRIMARY KEY,
+        processed_at TEXT
+    )
+    ''')
+
     conn.commit()
     return conn
 
@@ -78,6 +86,14 @@ def parse_json(json_path, db_path):
 
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
+
+    game_id = data.get('gameId')
+    if game_id:
+        cursor.execute('SELECT game_id FROM processed_games WHERE game_id = ?', (game_id,))
+        if cursor.fetchone():
+            print(f"Game {game_id} already processed. Skipping file {json_path}.")
+            conn.close()
+            return False
 
     for hand in data.get('hands', []):
         # 1. Standard Play Filter
@@ -214,8 +230,13 @@ def parse_json(json_path, db_path):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (hand_id, player_id, action, amount, pot_size, stage, timestamp, raw_entry))
 
+    if game_id:
+        cursor.execute('INSERT OR IGNORE INTO processed_games (game_id, processed_at) VALUES (?, ?)',
+                       (game_id, datetime.now().isoformat()))
+
     conn.commit()
     conn.close()
+    return True
 
 import shutil
 import glob
