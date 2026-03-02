@@ -176,8 +176,11 @@ class PokerAnalytics:
         if df.empty:
             return df
 
-        # Calculate bet size relative to pot
-        df['pct_of_pot'] = df['amount'] / df['pot_size']
+        # Calculate bet size relative to pot before the bet
+        df['pot_before'] = df['pot_size'] - df['amount']
+        # Avoid division by zero
+        df.loc[df['pot_before'] <= 0, 'pot_before'] = 0.01
+        df['pct_of_pot'] = df['amount'] / df['pot_before']
 
         def categorize_bet(pct):
             if pct < 0.33: return 'Small (<33%)'
@@ -599,35 +602,71 @@ class PokerAnalytics:
         except Exception as e:
             return pd.DataFrame()
 
-    def get_hero_leaks(self, hero_id="EJd9KHwjJa"):
+    def get_visual_analytics_data(self, min_hands=100):
+        query = """
+        WITH bb_sizes AS (
+            SELECT hand_id, MAX(amount) as bb_amount
+            FROM events
+            WHERE action = 'post_bb'
+            GROUP BY hand_id
+        ),
+        player_street_investment AS (
+            SELECT hand_id, player_id, stage, MAX(amount) as street_max
+            FROM events
+            WHERE action IN ('post_sb', 'post_bb', 'post_other', 'call', 'raise', 'bet', 'raise_to_amount')
+            GROUP BY hand_id, player_id, stage
+        ),
+        player_investment AS (
+            SELECT hand_id, player_id, SUM(street_max) as invested
+            FROM player_street_investment
+            GROUP BY hand_id, player_id
+        ),
+        player_returned AS (
+            SELECT hand_id, player_id, SUM(amount) as returned
+            FROM events
+            WHERE action = 'returned'
+            GROUP BY hand_id, player_id
+        ),
+        player_collected AS (
+            SELECT hand_id, player_id, SUM(amount) as collected
+            FROM events
+            WHERE action = 'collect'
+            GROUP BY hand_id, player_id
+        ),
+        player_pnl_bb AS (
+            SELECT
+                pi.player_id,
+                SUM((COALESCE(pc.collected, 0) + COALESCE(pr.returned, 0) - pi.invested) / COALESCE(b.bb_amount, 0.5)) as total_bb_won
+            FROM player_investment pi
+            LEFT JOIN player_collected pc ON pi.hand_id = pc.hand_id AND pi.player_id = pc.player_id
+            LEFT JOIN player_returned pr ON pi.hand_id = pr.hand_id AND pi.player_id = pr.player_id
+            LEFT JOIN bb_sizes b ON pi.hand_id = b.hand_id
+            GROUP BY pi.player_id
+        )
+        SELECT
+            pp.player_id,
+            p.player_name as display_name,
+            pp.total_hands,
+            pp.vpip_pct,
+            pp.pfr_pct,
+            pp.wtsd_pct,
+            pp.wsd_pct,
+            pp.profile_tag,
+            pnl.total_bb_won,
+            ROUND((pnl.total_bb_won / (CAST(pp.total_hands AS FLOAT) / 100)), 2) as bb_per_100
+        FROM player_priors pp
+        LEFT JOIN (
+            SELECT player_id, player_name, ROW_NUMBER() OVER(PARTITION BY player_id ORDER BY COUNT(*) DESC) as rn
+            FROM players GROUP BY player_id, player_name
+        ) p ON pp.player_id = p.player_id AND p.rn = 1
+        LEFT JOIN player_pnl_bb pnl ON pp.player_id = pnl.player_id
+        WHERE pp.total_hands >= ?
+        """
         try:
-            query = "SELECT * FROM player_priors WHERE player_id = ?"
-            df = pd.read_sql_query(query, self.conn, params=(hero_id,))
-            if df.empty:
-                return None
+            return pd.read_sql_query(query, self.conn, params=(min_hands,))
+        except Exception as e:
+            return pd.DataFrame()
 
-            hero = df.iloc[0]
-            leaks = []
-            if hero['wtsd_pct'] > 32:
-                leaks.append(f"WTSD% is {hero['wtsd_pct']}% (Optimal: 25-30%). Leaning towards Calling Station tendency.")
-            elif hero['wtsd_pct'] < 25 and hero['wtsd_pct'] > 0:
-                leaks.append(f"WTSD% is {hero['wtsd_pct']}% (Optimal: 25-30%). Might be folding too much on earlier streets.")
-
-            if hero['wsd_pct'] < 50 and hero['wsd_pct'] > 0:
-                leaks.append(f"WSD% is {hero['wsd_pct']}% (Optimal: >50%). Losing at showdown, calling lightly or bluff-catching badly.")
-
-            if hero['wwsf_pct'] < 45 and hero['wwsf_pct'] > 0:
-                leaks.append(f"WWSF% is {hero['wwsf_pct']}% (Optimal: 45-50%). Giving up too easily post-flop.")
-
-            if not leaks:
-                leaks.append("Your core stats look solid! No major leaks detected based on TAG benchmarks.")
-
-            return {
-                "stats": hero,
-                "leaks": leaks
-            }
-        except Exception:
-            return None
 
 if __name__ == "__main__":
     analytics = PokerAnalytics()
@@ -640,3 +679,306 @@ if __name__ == "__main__":
     first_id = analytics.get_priors()['player_id'].iloc[0]
     print(f"Testing for ID: {first_id}")
     print(analytics.get_profit_loss_by_position(first_id))
+class LineExploitEngine:
+    def __init__(self, db_path='pokernow.db'):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+
+    def _map_strength(self, desc):
+        desc = str(desc).lower()
+        if 'royal flush' in desc or 'straight flush' in desc or 'quads' in desc or 'four of a kind' in desc or 'full house' in desc:
+            return 4 # Nuts
+        if 'flush' in desc or 'straight' in desc or 'set' in desc or 'three of a kind' in desc or 'trips' in desc:
+            return 3 # Strong
+        if 'two pair' in desc or 'top pair' in desc:
+            return 2 # Medium
+        if 'pair' in desc: # under top pair
+            return 1 # Weak
+        return 0 # Air
+
+    def _classify_texture(self, board_cards):
+        if not board_cards or len(board_cards) < 3: return ['Dry']
+        tags = []
+        ranks = [c[0].upper() for c in board_cards if c]
+        suits = [c[1].lower() for c in board_cards if c]
+
+        from collections import Counter
+        suit_counts = Counter(suits)
+        if any(cnt >= 3 for cnt in suit_counts.values()):
+            tags.append('Monotone')
+
+        rank_counts = Counter(ranks)
+        if any(cnt >= 2 for cnt in rank_counts.values()):
+            tags.append('Paired')
+
+        rank_order = {'A':14, 'K':13, 'Q':12, 'J':11, 'T':10, '9':9, '8':8, '7':7, '6':6, '5':5, '4':4, '3':3, '2':2}
+        vals = sorted(list(set([rank_order.get(r, 0) for r in ranks])))
+
+        connected = False
+        for i in range(len(vals) - 2):
+            if vals[i+2] - vals[i] == 2 and vals[i+1] - vals[i] == 1:
+                connected = True
+                break
+        if 14 in vals and 2 in vals and 3 in vals:
+            connected = True
+        if connected:
+            tags.append('Connected')
+
+        # Broadway (2+ cards T, J, Q, K, A)
+        if sum(1 for k in ranks if rank_order.get(k, 0) >= 10) >= 2:
+            tags.append('Broadway')
+
+        if not tags:
+            tags.append('Dry')
+
+        return tags
+
+    def _map_pos(self, rank, n):
+        if pd.isna(rank) or rank == 999999 or pd.isna(n) or n == 0: return 'Unknown'
+        rank, n = int(rank), int(n)
+        if n == 2:
+            if rank == 1: return 'SB'
+            if rank == 2: return 'BB'
+            return f'Pos {rank}'
+        if rank == 1: return 'SB'
+        if rank == 2: return 'BB'
+        if rank == n: return 'BTN'
+        if rank == n - 1: return 'CO'
+        if rank == n - 2: return 'HJ'
+        if rank == 3: return 'UTG'
+        if rank == 4: return 'UTG+1' if n >= 8 else 'MP'
+        if rank == 5: return 'MP' if n >= 9 else 'MP+1'
+        if rank == 6: return 'MP+1'
+        return f'Pos {rank}'
+
+    def build_action_lines(self):
+        import json
+
+        query = """
+        SELECT e.hand_id, e.player_id, e.stage, e.action, e.amount, e.pot_size, e.board_cards, e.raw_entry,
+               p.player_name as display_name,
+               RANK() OVER(PARTITION BY e.hand_id ORDER BY CASE WHEN e.stage='Preflop' AND (e.action LIKE 'post_%' OR e.action IN ('fold','call','raise','check')) THEN MIN(e.id) ELSE 999999 END ASC) as pos_rank
+        FROM events e
+        LEFT JOIN (
+            SELECT player_id, player_name, ROW_NUMBER() OVER(PARTITION BY player_id ORDER BY COUNT(*) DESC) as rn
+            FROM players GROUP BY player_id, player_name
+        ) p ON e.player_id = p.player_id AND p.rn = 1
+        GROUP BY e.hand_id, e.player_id, e.stage, e.action, e.amount, e.pot_size, e.board_cards, e.raw_entry, p.player_name
+        ORDER BY e.hand_id, MIN(e.id) ASC
+        """
+        df = pd.read_sql_query(query, self.conn)
+
+        lines = []
+        hand_groups = df.groupby('hand_id')
+
+        for hand_id, group in hand_groups:
+            player_states = {} # pid -> {'line': [], 'strength': None, 'last_sizing': None, 'texture': []}
+            current_board = []
+
+            for _, row in group.iterrows():
+                pid = row['player_id']
+                stage = row['stage']
+                action = row['action']
+                amount = row['amount']
+                pot_size = row['pot_size']
+                b_cards = row['board_cards']
+                raw_entry = row['raw_entry']
+
+                if b_cards:
+                    current_board = b_cards.split(',')
+
+                if pid == 'Dealer' or not pid:
+                    continue
+
+                if action == 'show' or stage == 'Showdown':
+                    try:
+                        payload = json.loads(raw_entry)
+                        desc = payload.get('handDescription')
+                        if not desc and 'hand' in payload and isinstance(payload['hand'], dict):
+                            desc = payload['hand'].get('name') or payload['hand'].get('description')
+
+                        # Try taking from combination if description isn't present
+                        if not desc and 'combination' in payload:
+                             desc = "pair" if len(set([c[0] for c in payload['combination']])) < 5 else "high card"
+
+                        if desc and pid in player_states:
+                           player_states[pid]['strength'] = self._map_strength(desc)
+                    except:
+                        pass
+                    continue
+
+                if pid not in player_states:
+                    player_states[pid] = {'line': [], 'strength': None, 'last_sizing': None, 'texture': [], 'display_name': row['display_name'], 'pos_rank': row['pos_rank']}
+
+                # Determine action code
+                code = None
+                if stage == 'Preflop':
+                    if action in ['raise', 'raise_to_amount']: code = 'PFR'
+                    elif action == 'call': code = 'PFC'
+                elif stage == 'Flop':
+                    if action in ['bet', 'raise', 'raise_to_amount']: code = 'F-Bet'
+                    elif action == 'call': code = 'F-Call'
+                elif stage == 'Turn':
+                    if action in ['bet', 'raise', 'raise_to_amount']: code = 'T-Bet'
+                    elif action == 'call': code = 'T-Call'
+                elif stage == 'River':
+                    if action in ['bet', 'raise', 'raise_to_amount']: code = 'R-Bet'
+                    elif action == 'call': code = 'R-Call'
+
+                if code and (not player_states[pid]['line'] or player_states[pid]['line'][-1] != code):
+                    player_states[pid]['line'].append(code)
+
+                if action in ['bet', 'raise', 'raise_to_amount'] and pot_size and pot_size > 0:
+                    pot_before = pot_size - amount
+                    pct = (amount / pot_before) if pot_before > 0 else 1.5
+                    sizing = 'Overbet (>120%)'
+                    if pct < 0.4: sizing = 'Small (<40%)'
+                    elif pct <= 0.8: sizing = 'Medium (40-80%)'
+                    elif pct <= 1.2: sizing = 'Large (80-120%)'
+                    player_states[pid]['last_sizing'] = sizing
+                    player_states[pid]['texture'] = self._classify_texture(current_board)
+
+            # Calculate simple positions based on pos_rank order
+            num_players = len([p for p in player_states.values() if p['pos_rank'] == p['pos_rank']]) # Ignore nan
+
+            for pid, state in player_states.items():
+                if state['line']:
+                    str_line = "_".join(state['line'])
+                    pos_str = self._map_pos(state['pos_rank'], num_players)
+                    lines.append({
+                        'hand_id': hand_id,
+                        'player_id': pid,
+                        'display_name': state['display_name'],
+                        'position': pos_str,
+                        'action_line': str_line,
+                        'sizing_bucket': state['last_sizing'],
+                        'texture_tags': ','.join(state['texture']) if state['texture'] else 'Dry',
+                        'strength_tier': state['strength']
+                    })
+
+        return pd.DataFrame(lines)
+
+    def get_hand_events(self, hand_id):
+        query = """
+        WITH PlayerFirstAction AS (
+            SELECT hand_id, player_id, MIN(id) as first_action_id
+            FROM events
+            WHERE hand_id = ? AND stage='Preflop' AND (action LIKE 'post_%' OR action IN ('fold','call','raise','check'))
+            GROUP BY hand_id, player_id
+        ),
+        RankedPlayers AS (
+            SELECT hand_id, player_id, RANK() OVER(PARTITION BY hand_id ORDER BY first_action_id ASC) as pos_rank
+            FROM PlayerFirstAction
+        )
+        SELECT e.id, e.stage, e.action, e.amount, e.pot_size, e.board_cards, e.player_id, e.raw_entry,
+               COALESCE(p.player_name, e.player_id) as actor,
+               rp.pos_rank,
+               (SELECT COUNT(DISTINCT player_id) FROM PlayerFirstAction WHERE hand_id = ?) as table_size
+        FROM events e
+        LEFT JOIN (
+            SELECT player_id, player_name, ROW_NUMBER() OVER(PARTITION BY player_id ORDER BY COUNT(*) DESC) as rn
+            FROM players GROUP BY player_id, player_name
+        ) p ON e.player_id = p.player_id AND p.rn = 1
+        LEFT JOIN RankedPlayers rp ON e.hand_id = rp.hand_id AND e.player_id = rp.player_id
+        WHERE e.hand_id = ?
+        ORDER BY e.id ASC
+        """
+        df = pd.read_sql_query(query, self.conn, params=(hand_id, hand_id, hand_id))
+
+        # apply positional mapping
+        df['position'] = df.apply(lambda row: self._map_pos(row['pos_rank'], row['table_size']), axis=1)
+
+        def extract_details(row):
+            import json
+            try:
+                if not row['raw_entry']:
+                    return ""
+                payload = json.loads(row['raw_entry'])
+                cards = payload.get('cards')
+                if not cards and 'hand' in payload and isinstance(payload['hand'], dict):
+                    cards = payload['hand'].get('cards')
+                if cards and isinstance(cards, list):
+                    valid_cards = [c for c in cards if c is not None]
+                    if valid_cards:
+                        return "Cards: " + ", ".join(valid_cards)
+            except:
+                pass
+            return ""
+
+        df['details'] = df.apply(extract_details, axis=1)
+        return df
+
+    def get_triple_barrel_auditor(self, df_lines=None):
+        if df_lines is None:
+            df_lines = self.build_action_lines()
+        if df_lines.empty: return pd.DataFrame(), 0, pd.DataFrame()
+
+        # Find lines containing F-Bet_T-Bet_R-Bet
+        tb = df_lines[df_lines['action_line'].str.contains('F-Bet_T-Bet_R-Bet', regex=False, na=False)]
+
+        showdowns = tb.dropna(subset=['strength_tier'])
+        freq = 0
+        if not showdowns.empty:
+            bluffs = showdowns[showdowns['strength_tier'] <= 1]
+            freq = len(bluffs) / len(showdowns) * 100
+
+        # Sizing vs Strength correlation across ALL lines not just triple barrel
+        all_showdowns = df_lines.dropna(subset=['strength_tier'])
+        sizing_groups = pd.DataFrame()
+        if not all_showdowns.empty:
+            sizing_groups = all_showdowns.groupby(['sizing_bucket', 'strength_tier']).size().unstack(fill_value=0)
+
+        return tb, freq, sizing_groups
+
+    def get_exploit_finder(self, df_lines=None):
+        if df_lines is None:
+             df_lines = self.build_action_lines()
+
+        showdowns = df_lines.dropna(subset=['strength_tier'])
+        if showdowns.empty: return pd.DataFrame(), pd.DataFrame()
+
+        agg = showdowns.groupby('action_line').agg(
+            total_showdowns=('strength_tier', 'count'),
+            bluffs=('strength_tier', lambda x: (x <= 1).sum()),
+            wins=('strength_tier', lambda x: (x >= 2).sum())
+        ).reset_index()
+
+        agg['bluff_freq'] = (agg['bluffs'] / agg['total_showdowns']) * 100
+        agg['wsd_pct'] = (agg['wins'] / agg['total_showdowns']) * 100
+
+        # filter for statistical significance (>= 20 data points requirement)
+        agg = agg[agg['total_showdowns'] >= 20]
+
+        under_bluffed = agg[(agg['wsd_pct'] > 65) & (agg['bluff_freq'] < 10)].sort_values('total_showdowns', ascending=False).head(3)
+        over_bluffed = agg[agg['bluff_freq'] > 40].sort_values('total_showdowns', ascending=False).head(3)
+
+        return under_bluffed, over_bluffed
+
+    def get_texture_bluff_map(self, df_lines=None):
+        if df_lines is None:
+            df_lines = self.build_action_lines()
+
+        if df_lines.empty:
+            return pd.DataFrame()
+
+        # We look at air-at-showdown frequency per explicit texture tag
+        showdowns = df_lines.dropna(subset=['strength_tier'])
+        if showdowns.empty: return pd.DataFrame()
+
+        records = []
+        for _, row in showdowns.iterrows():
+            tags = str(row['texture_tags']).split(',')
+            for t in tags:
+                if t:
+                    records.append({'tag': t, 'is_air': row['strength_tier'] <= 1})
+
+        if not records:
+             return pd.DataFrame()
+
+        tag_df = pd.DataFrame(records)
+        agg = tag_df.groupby('tag').agg(
+            total=('is_air', 'count'),
+            air=('is_air', 'sum')
+        ).reset_index()
+
+        agg['air_pct'] = (agg['air'] / agg['total']) * 100
+        return agg.sort_values('air_pct', ascending=False)

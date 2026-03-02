@@ -91,7 +91,231 @@ if view_mode == "Exploit Dashboard":
     else:
         st.info("No sufficient data for Target List (requires >= 50 hands per player).")
 
+    st.subheader("Visual Analytics")
+    visual_df = analytics.get_visual_analytics_data(min_hands=100)
 
+    if not visual_df.empty:
+        st.markdown("### The Regulars Scatter (>100 Hands)")
+        fig1, ax1 = plt.subplots(figsize=(10, 7))
+
+        # Use 'RdYlGn' to color by win rate. Green for positive, Red for negative.
+        scatter1 = sns.scatterplot(
+            data=visual_df,
+            x='vpip_pct',
+            y='pfr_pct',
+            hue='bb_per_100',
+            palette='RdYlGn',
+            size='total_hands',
+            sizes=(100, 800),
+            alpha=0.8,
+            ax=ax1,
+            legend=True
+        )
+
+        for _, row in visual_df.iterrows():
+            ax1.annotate(
+                row['display_name'],
+                (row['vpip_pct'], row['pfr_pct']),
+                xytext=(0, 8),
+                textcoords='offset points',
+                ha='center',
+                fontsize=9
+            )
+
+        ax1.set_xlabel("VPIP %")
+        ax1.set_ylabel("PFR %")
+        ax1.set_title("VPIP vs PFR (colored by BB/100)")
+        ax1.set_xlim(left=0)
+        ax1.set_ylim(bottom=0)
+
+        # Place legend outside so it doesn't overlap points
+        # We want to keep the 'bb_per_100' legend but maybe suppress the 'total_hands' size legend to keep it clean
+        handles, labels = ax1.get_legend_handles_labels()
+        # Find the index where sizes start to split out the hue vs size legends
+        try:
+            size_index = labels.index('total_hands')
+            ax1.legend(handles[:size_index], labels[:size_index], title="BB/100", bbox_to_anchor=(1.05, 1), loc='upper left')
+        except ValueError:
+            ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        st.pyplot(fig1)
+
+        st.divider()
+
+        st.markdown("### Showdown Efficiency")
+        fig2, ax2 = plt.subplots(figsize=(10, 7))
+
+        sns.scatterplot(
+            data=visual_df,
+            x='wtsd_pct',
+            y='wsd_pct',
+            hue='profile_tag',
+            size='total_hands',
+            sizes=(100, 800),
+            alpha=0.8,
+            ax=ax2
+        )
+
+        for _, row in visual_df.iterrows():
+            ax2.annotate(
+                row['display_name'],
+                (row['wtsd_pct'], row['wsd_pct']),
+                xytext=(0, 8),
+                textcoords='offset points',
+                ha='center',
+                fontsize=9
+            )
+
+        # Vertical line at 27% average WTSD
+        ax2.axvline(27, color='red', linestyle='--', label='Avg WTSD (27%)')
+        # Add a horizontal line at 50% WSD indicating break-even at showdown
+        ax2.axhline(50, color='gray', linestyle=':', label='Break-even WSD (50%)')
+
+        ax2.set_xlabel("WTSD %")
+        ax2.set_ylabel("WSD %")
+        ax2.set_title("WTSD vs WSD")
+        ax2.set_xlim(left=0)
+        ax2.set_ylim(bottom=0)
+
+        handles, labels = ax2.get_legend_handles_labels()
+        try:
+            size_index = labels.index('total_hands')
+            ax2.legend(handles[:size_index], labels[:size_index], title="Profile Tag", bbox_to_anchor=(1.05, 1), loc='upper left')
+        except ValueError:
+            ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        st.pyplot(fig2)
+
+        st.divider()
+        st.subheader("Line Exploit Engine")
+
+        st.info("""
+        **Action Line Terminology:**
+        * **PFR:** Preflop Raise
+        * **PFC:** Preflop Call
+        * **F-Bet / F-Call:** Flop Bet / Flop Call
+        * **T-Bet / T-Call:** Turn Bet / Turn Call
+        * **R-Bet / R-Call:** River Bet / River Call
+        _Example: `PFC_F-Call_T-Bet_R-Bet` means the player called preflop, called the flop, bet the turn, and bet the river._
+        """)
+
+        with st.spinner("Analyzing Action Lines..."):
+            from analytics import LineExploitEngine
+            engine = LineExploitEngine('pokernow.db')
+            df_lines = engine.build_action_lines()
+
+            if not df_lines.empty:
+                tb, freq, sizing_groups = engine.get_triple_barrel_auditor(df_lines)
+                ub, ob = engine.get_exploit_finder(df_lines)
+                tex_map = engine.get_texture_bluff_map(df_lines)
+
+                # Sizing Heatmap
+                st.markdown("### Sizing vs. Strength Correlation")
+                if not sizing_groups.empty:
+                    fig_sz, ax_sz = plt.subplots(figsize=(8, 4))
+                    sns.heatmap(sizing_groups, annot=True, fmt=".0f", cmap="Reds", ax=ax_sz)
+                    ax_sz.set_xlabel("Strength Tier (0=Air, 4=Nuts)")
+                    ax_sz.set_ylabel("Sizing Bucket")
+                    st.pyplot(fig_sz)
+                else:
+                    st.info("No sizing correlation data available.")
+
+                # Texture Bluff Map
+                st.markdown("### Texture Bluff Map (Air at Showdown %)")
+                if not tex_map.empty:
+                    fig_tx, ax_tx = plt.subplots(figsize=(8, 4))
+                    sns.barplot(data=tex_map, x='tag', y='air_pct', hue='tag', palette='viridis', legend=False, ax=ax_tx)
+                    ax_tx.set_ylabel("Air % at Showdown")
+                    ax_tx.set_xlabel("Board Texture Tag")
+                    for container in ax_tx.containers:
+                        ax_tx.bar_label(container, fmt='%.1f%%')
+                    st.pyplot(fig_tx)
+
+                # Top 3 Exploit Lines
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### Top 3 Under-Bluffed Lines (<10% Bluff)")
+                    if not ub.empty:
+                        st.dataframe(ub[['action_line', 'total_showdowns', 'bluff_freq', 'wsd_pct']].style.format({'bluff_freq':'{:.1f}%', 'wsd_pct':'{:.1f}%'}), hide_index=True)
+                    else:
+                        st.write("None found.")
+                with col2:
+                    st.markdown("#### Top 3 Over-Bluffed Lines (>40% Bluff)")
+                    if not ob.empty:
+                        st.dataframe(ob[['action_line', 'total_showdowns', 'bluff_freq', 'wsd_pct']].style.format({'bluff_freq':'{:.1f}%', 'wsd_pct':'{:.1f}%'}), hide_index=True)
+                    else:
+                        st.write("None found.")
+
+                # Verification String
+                if not tb.empty:
+                    most_common_texture = tb['texture_tags'].mode().iloc[0] if not tb['texture_tags'].mode().empty else 'Dry'
+                    most_common_size = tb['sizing_bucket'].mode().iloc[0] if not tb['sizing_bucket'].mode().empty else 'Unknown'
+                    st.info(f"**Verification Check:** In this pool, players triple-barreling on **{most_common_texture}** boards with **{most_common_size}** bets show up with Air **{freq:.1f}%** of the time.")
+
+                # Full Lines Table
+                st.divider()
+                st.markdown("### All Action Lines (Showdown Analyzed)")
+                showdowns = df_lines.dropna(subset=['strength_tier'])
+                if not showdowns.empty:
+                    agg = showdowns.groupby('action_line').agg(
+                        total_showdowns=('strength_tier', 'count'),
+                        bluffs=('strength_tier', lambda x: (x <= 1).sum()),
+                        wins=('strength_tier', lambda x: (x >= 2).sum())
+                    ).reset_index()
+                    agg['bluff_freq'] = (agg['bluffs'] / agg['total_showdowns']) * 100
+                    agg['wsd_pct'] = (agg['wins'] / agg['total_showdowns']) * 100
+                    agg = agg.sort_values('total_showdowns', ascending=False)
+
+                    st.dataframe(
+                        agg.style.format({'bluff_freq':'{:.1f}%', 'wsd_pct':'{:.1f}%'})
+                                 .background_gradient(subset=["bluff_freq"], cmap="Reds")
+                                 .background_gradient(subset=["wsd_pct"], cmap="Greens"),
+                        use_container_width=True, hide_index=True
+                    )
+                else:
+                    st.write("No showdown data available for lines.")
+
+                # Example Lines Engine
+                st.markdown("### Example Lines Inspector")
+                st.write("View individual instances of an action line to study the exact boards and hand strengths.")
+                unique_lines = df_lines['action_line'].unique().tolist()
+                selected_line = st.selectbox("Select Action Line:", sorted(unique_lines))
+
+                if selected_line:
+                    examples = df_lines[(df_lines['action_line'] == selected_line) & (df_lines['strength_tier'].notna())]
+                    if not examples.empty:
+                        # Map strength tier back to text for readability
+                        tier_map = {0: 'Air (High Card)', 1: 'Weak (Pair)', 2: 'Medium (Top/Two Pair)', 3: 'Strong (Set/Str/Fl)', 4: 'Nuts (FH+)'}
+                        examples['Hand Strength'] = examples['strength_tier'].map(tier_map)
+
+                        display_examples = examples[['hand_id', 'display_name', 'position', 'sizing_bucket', 'texture_tags', 'Hand Strength']]
+                        display_examples.columns = ['Hand ID', 'Player', 'Position', 'Final Sizing', 'Board Textures', 'Hand Strength']
+                        st.dataframe(display_examples, use_container_width=True, hide_index=True)
+
+                        st.markdown("#### Full Hand Log")
+                        selected_hand = st.selectbox("Select Hand to inspect:", examples['hand_id'].unique())
+                        if selected_hand:
+                            events_df = engine.get_hand_events(selected_hand)
+                            if not events_df.empty:
+                                if 'position' in events_df.columns:
+                                    display_log = events_df[['stage', 'position', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                                    display_log.columns = ['Stage', 'Pos', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+                                else:
+                                    display_log = events_df[['stage', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                                    display_log.columns = ['Stage', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+
+                                # Estimate height to eliminate vertical scrollbar (approx 35px per row + 40px header)
+                                optimal_height = len(display_log) * 35 + 40
+                                st.dataframe(display_log, use_container_width=True, hide_index=True, height=optimal_height)
+
+                    else:
+                        st.info("No showdown examples recorded for this line yet.")
+
+            else:
+                st.info("No action line data available.")
+
+    else:
+        st.info("No sufficient data for Visual Analytics (requires >100 hands per player).")
 
 elif view_mode == "Net PnL Leaderboard":
     st.header("Net PnL Leaderboard")

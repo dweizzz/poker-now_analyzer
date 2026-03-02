@@ -48,6 +48,7 @@ def init_db(db_path):
         stage TEXT,     -- 'Preflop', 'Flop', 'Turn', 'River', 'Showdown'
         timestamp TEXT,
         raw_entry TEXT,
+        board_cards TEXT,
         FOREIGN KEY(hand_id) REFERENCES hands(hand_id)
     )
     ''')
@@ -152,6 +153,7 @@ def parse_json(json_path, db_path):
 
         stage = "Preflop"
         pot_size = 0.0
+        board_cards = []
 
         for event in hand.get('events', []):
             at = event['at']
@@ -192,8 +194,8 @@ def parse_json(json_path, db_path):
             elif evt_type == 8:
                 action = 'raise' # Covers both bet and raise
                 amount = get_val(payload.get('value', 0))
-                # Not perfectly accurate for pot size without full player state,
-                # but we just keep it simple as in the MVP
+                # Simple approximation for MVP pot tracking:
+                pot_size += amount
             elif evt_type == 16:
                 # Uncalled bet returned
                 action = 'returned'
@@ -219,16 +221,21 @@ def parse_json(json_path, db_path):
                     stage = "River"
                     action = 'deal_river'
                 player_id = 'Dealer'
+                if 'cards' in payload:
+                    for card in payload['cards']:
+                        if card and card not in board_cards:
+                            board_cards.append(card)
             else:
                 action = 'other'
 
             if action and player_id:
                 # Store the raw JSON payload as string just in case
                 raw_entry = json.dumps(payload)
+                board_str = ','.join(board_cards)
                 cursor.execute('''
-                INSERT INTO events (hand_id, player_id, action, amount, pot_size, stage, timestamp, raw_entry)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (hand_id, player_id, action, amount, pot_size, stage, timestamp, raw_entry))
+                INSERT INTO events (hand_id, player_id, action, amount, pot_size, stage, timestamp, raw_entry, board_cards)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (hand_id, player_id, action, amount, pot_size, stage, timestamp, raw_entry, board_str))
 
     if game_id:
         cursor.execute('INSERT OR IGNORE INTO processed_games (game_id, processed_at) VALUES (?, ?)',

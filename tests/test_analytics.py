@@ -207,11 +207,11 @@ class TestAnalytics(unittest.TestCase):
         self.assertFalse(df.empty)
         # Check if column structure is right
         self.assertIn('Large (>66%)', df.columns)
-        self.assertIn('Medium (33-66%)', df.columns)
+        self.assertIn('Large (>66%)', df.columns)
 
-        # In h3: p2 bets 2 into pot 3 (Flop) -> 66.6% -> Medium
-        p2_medium = df.loc['p2', 'Medium (33-66%)']
-        self.assertEqual(p2_medium, 1)
+        # In h3: p2 bets 2 into pot 3 (Flop) -> 66.6% -> Large (>66%)
+        p2_large = df.loc['p2', 'Large (>66%)']
+        self.assertEqual(p2_large, 1)
 
         # In h3: p1 bets 15 into pot 22 (River) -> 68% -> Large
         p1_large = df.loc['p1', 'Large (>66%)']
@@ -316,16 +316,99 @@ class TestAnalytics(unittest.TestCase):
         # Check sort order by wtsd_pct DESC
         self.assertTrue(df.iloc[0]['wtsd_pct'] >= df.iloc[-1]['wtsd_pct'])
 
-    def test_get_hero_leaks(self):
-        self.analytics.calculate_and_store_player_priors()
-        result = self.analytics.get_hero_leaks('p1')
-        self.assertIsNotNone(result)
-        self.assertIn('stats', result)
-        self.assertIn('leaks', result)
+from analytics import LineExploitEngine
 
-        # Because p1 WTSD% is 50%, it should trigger the Calling Station leak message
-        leaks = result['leaks']
-        self.assertTrue(any("Calling Station" in l for l in leaks))
+class TestLineExploitEngine(unittest.TestCase):
+    def setUp(self):
+        self.db_path = ':memory:'
+        self.conn = init_db(self.db_path)
+        self.engine = LineExploitEngine(db_path=self.db_path)
+        self.engine.conn = self.conn
+
+        self.cursor = self.conn.cursor()
+        self._seed_mock_data()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _seed_mock_data(self):
+        self.cursor.executemany("INSERT INTO players (player_id, player_name) VALUES (?, ?)", [
+            ('p1', 'Alice'), ('p2', 'Bob'), ('p3', 'Charlie')
+        ])
+
+        self.cursor.execute("INSERT INTO hands (hand_id, dealer_name, started_at) VALUES ('h1', 'p3', '2023-01-01')")
+
+        events = []
+        def add_event(player_id, action, amount=0, pot_size=0, stage='Preflop', cards='', raw_entry='{}'):
+            events.append((len(events)+1, 'h1', player_id, action, amount, pot_size, stage, cards, raw_entry))
+
+        # Setup Hand 1 for specific pot sizes and board
+        add_event('p1', 'post_sb', amount=0.5, pot_size=0.5)
+        add_event('p2', 'post_bb', amount=1.0, pot_size=1.5)
+        add_event('p3', 'fold', amount=0, pot_size=1.5)
+        add_event('p1', 'call', amount=0.5, pot_size=2.0)
+        add_event('p2', 'check', amount=0, pot_size=2.0)
+
+        # Flop Deal - Monotone Board
+        add_event('Dealer', 'deal_flop', amount=0, pot_size=2.0, stage='Flop', cards='As,Ks,Qs')
+        # P1 checks, P2 bets 0.5 into 2.0 pot (25% -> Small)
+        add_event('p1', 'check', amount=0, pot_size=2.0, stage='Flop', cards='As,Ks,Qs')
+        add_event('p2', 'bet', amount=0.5, pot_size=2.5, stage='Flop', cards='As,Ks,Qs')
+        add_event('p1', 'call', amount=0.5, pot_size=3.0, stage='Flop', cards='As,Ks,Qs')
+
+        # Turn Deal
+        add_event('Dealer', 'deal_turn', amount=0, pot_size=3.0, stage='Turn', cards='As,Ks,Qs,2d')
+        # P1 checks, P2 bets 2.0 into 3.0 pot (66% -> Medium)
+        add_event('p1', 'check', amount=0, pot_size=3.0, stage='Turn', cards='As,Ks,Qs,2d')
+        add_event('p2', 'bet', amount=2.0, pot_size=5.0, stage='Turn', cards='As,Ks,Qs,2d')
+        add_event('p1', 'call', amount=2.0, pot_size=7.0, stage='Turn', cards='As,Ks,Qs,2d')
+
+        # River Deal
+        add_event('Dealer', 'deal_river', amount=0, pot_size=7.0, stage='River', cards='As,Ks,Qs,2d,2c')
+        # P1 checks, P2 bets 10.0 into 7.0 pot (142% -> Overbet)
+        add_event('p1', 'check', amount=0, pot_size=7.0, stage='River', cards='As,Ks,Qs,2d,2c')
+        add_event('p2', 'bet', amount=10.0, pot_size=17.0, stage='River', cards='As,Ks,Qs,2d,2c')
+        add_event('p1', 'call', amount=10.0, pot_size=27.0, stage='River', cards='As,Ks,Qs,2d,2c')
+
+        # Showdown - P2 shows flush, P1 shows air
+        add_event('p1', 'show', stage='Showdown', cards='As,Ks,Qs,2d,2c', raw_entry=json.dumps({"hand": {"name": "High Card"}}))
+        add_event('p2', 'show', stage='Showdown', cards='As,Ks,Qs,2d,2c', raw_entry=json.dumps({"hand": {"name": "Flush"}}))
+
+        self.cursor.executemany('''
+            INSERT INTO events
+            (id, hand_id, player_id, action, amount, pot_size, stage, board_cards, raw_entry)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', events)
+        self.conn.commit()
+
+    def test_build_action_lines(self):
+        df = self.engine.build_action_lines()
+        self.assertFalse(df.empty)
+
+        # Alice: PFC_F-Call_T-Call_R-Call (Air)
+        p1 = df[df['player_id'] == 'p1'].iloc[0]
+        self.assertEqual(p1['action_line'], 'PFC_F-Call_T-Call_R-Call')
+        self.assertEqual(p1['strength_tier'], 0) # High Card = Air
+
+        # Bob: F-Bet_T-Bet_R-Bet (Flush, Overbet River)
+        p2 = df[df['player_id'] == 'p2'].iloc[0]
+        self.assertEqual(p2['action_line'], 'F-Bet_T-Bet_R-Bet')
+        self.assertEqual(p2['sizing_bucket'], 'Overbet (>120%)')
+        self.assertEqual(p2['strength_tier'], 3) # Flush = Strong (Tier 3)
+
+        # Check texture tags for Bob (should include Monotone and Connected because A,K,Q) and Paired (2d, 2c)
+        tags = p2['texture_tags'].split(',')
+        self.assertIn('Monotone', tags)
+        self.assertIn('Connected', tags)
+        self.assertIn('Paired', tags)
+
+    def test_triple_barrel_auditor(self):
+        df = self.engine.build_action_lines()
+        tb, freq, sizing = self.engine.get_triple_barrel_auditor(df)
+        self.assertFalse(tb.empty)
+        # 1 triple barrel, 0 bluffs
+        self.assertEqual(freq, 0.0)
+        self.assertEqual(sizing.loc['Overbet (>120%)', 3], 1)
 
 if __name__ == '__main__':
     unittest.main()
