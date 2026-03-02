@@ -52,7 +52,7 @@ if not priors_df.empty:
     priors_df = priors_df[priors_df['total_hands'] >= 50]
 
 st.sidebar.header("Navigation")
-view_mode = st.sidebar.radio("Select View", ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard"])
+view_mode = st.sidebar.radio("Select View", ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard", "My Leaks (Dan)"])
 
 if view_mode == "Exploit Dashboard":
     st.header("Opponent Intelligence & Exploit Dashboard")
@@ -494,3 +494,86 @@ elif view_mode == "Player Profile":
 
     else:
         st.warning("No data found in database. Please run ingest.py first.")
+
+elif view_mode == "My Leaks (Dan)":
+    st.header("My Leaks: Most & Least Profitable Lines")
+    st.info("Analyze your (Dan) specific action lines to see where you are making or losing the most money.")
+
+    with st.spinner("Analyzing Action Lines..."):
+        from analytics import LineExploitEngine
+        engine = LineExploitEngine('pokernow.db')
+        df_lines = engine.build_action_lines()
+
+        if not df_lines.empty:
+            hero_leaks_df = engine.get_hero_leaks(df_lines, hero_id="EJd9KHwjJa")
+
+            if not hero_leaks_df.empty:
+                # Filter for significance
+                sig_leaks = hero_leaks_df[hero_leaks_df['occurrences'] >= 5]
+                if sig_leaks.empty:
+                    sig_leaks = hero_leaks_df
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("### Most Profitable Lines")
+                    top_lines = sig_leaks.head(10).copy()
+                    st.dataframe(
+                        top_lines.style.format({'total_pnl': '{:.2f}', 'avg_pnl': '{:.2f}'})
+                            .background_gradient(subset=["total_pnl"], cmap="Greens"),
+                        use_container_width=True, hide_index=True
+                    )
+
+                with col2:
+                    st.markdown("### Least Profitable Lines")
+                    bottom_lines = sig_leaks.tail(10).sort_values('total_pnl', ascending=True).copy()
+                    st.dataframe(
+                        bottom_lines.style.format({'total_pnl': '{:.2f}', 'avg_pnl': '{:.2f}'})
+                            .background_gradient(subset=["total_pnl"], cmap="Reds"),
+                        use_container_width=True, hide_index=True
+                    )
+
+                st.divider()
+                st.markdown("### All Hero Action Lines")
+                st.dataframe(
+                    hero_leaks_df.style.format({'total_pnl': '{:.2f}', 'avg_pnl': '{:.2f}'})
+                        .background_gradient(subset=["total_pnl"], cmap="RdYlGn"),
+                    use_container_width=True, hide_index=True
+                )
+
+                st.markdown("### Example Lines Inspector (Hero)")
+                st.write("View individual instances of your action lines to study the exact boards and hand strengths.")
+                unique_lines = hero_leaks_df['action_line'].unique().tolist()
+                selected_line = st.selectbox("Select Action Line:", sorted(unique_lines), key="hero_line_select")
+
+                if selected_line:
+                    examples = df_lines[(df_lines['action_line'] == selected_line) & (df_lines['player_id'] == "EJd9KHwjJa") & (df_lines['strength_tier'].notna())]
+                    if not examples.empty:
+                        tier_map = {0: 'Air (High Card)', 1: 'Weak (Pair)', 2: 'Medium (Top/Two Pair)', 3: 'Strong (Set/Str/Fl)', 4: 'Nuts (FH+)'}
+                        examples_copy = examples.copy()
+                        examples_copy['Hand Strength'] = examples_copy['strength_tier'].map(tier_map)
+
+                        display_examples = examples_copy[['hand_id', 'position', 'sizing_bucket', 'texture_tags', 'Hand Strength']]
+                        display_examples.columns = ['Hand ID', 'Position', 'Final Sizing', 'Board Textures', 'Hand Strength']
+                        st.dataframe(display_examples, use_container_width=True, hide_index=True)
+
+                        st.markdown("#### Full Hand Log")
+                        selected_hand = st.selectbox("Select Hand to inspect:", examples['hand_id'].unique(), key="hero_hand_select")
+                        if selected_hand:
+                            events_df = engine.get_hand_events(selected_hand)
+                            if not events_df.empty:
+                                if 'position' in events_df.columns:
+                                    display_log = events_df[['stage', 'position', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                                    display_log.columns = ['Stage', 'Pos', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+                                else:
+                                    display_log = events_df[['stage', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                                    display_log.columns = ['Stage', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+
+                                optimal_height = len(display_log) * 35 + 40
+                                st.dataframe(display_log, use_container_width=True, hide_index=True, height=optimal_height)
+                    else:
+                         st.info("No showdown examples recorded for this line yet.")
+            else:
+                st.info("No action line data available for Hero.")
+        else:
+            st.info("No action line data available.")
+

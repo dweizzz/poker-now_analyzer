@@ -982,3 +982,62 @@ class LineExploitEngine:
 
         agg['air_pct'] = (agg['air'] / agg['total']) * 100
         return agg.sort_values('air_pct', ascending=False)
+
+    def get_hero_leaks(self, df_lines, hero_id="EJd9KHwjJa"):
+        if df_lines is None or df_lines.empty:
+            return pd.DataFrame()
+
+        hero_lines = df_lines[df_lines['player_id'] == hero_id]
+        if hero_lines.empty:
+            return pd.DataFrame()
+
+        # Get hero PNL per hand
+        query = '''
+        WITH player_street_investment AS (
+            SELECT hand_id, stage, MAX(amount) as street_max
+            FROM events
+            WHERE player_id = ? AND action IN ('post_sb', 'post_bb', 'post_other', 'call', 'raise', 'bet', 'raise_to_amount')
+            GROUP BY hand_id, stage
+        ),
+        player_investment AS (
+            SELECT hand_id, SUM(street_max) as invested
+            FROM player_street_investment
+            GROUP BY hand_id
+        ),
+        player_returned AS (
+            SELECT hand_id, SUM(amount) as returned
+            FROM events
+            WHERE player_id = ? AND action = 'returned'
+            GROUP BY hand_id
+        ),
+        player_collected AS (
+            SELECT hand_id, SUM(amount) as collected
+            FROM events
+            WHERE player_id = ? AND action = 'collect'
+            GROUP BY hand_id
+        ),
+        player_pnl AS (
+            SELECT
+                pi.hand_id,
+                COALESCE(pc.collected, 0) + COALESCE(pr.returned, 0) - pi.invested as net_profit
+            FROM player_investment pi
+            LEFT JOIN player_collected pc ON pi.hand_id = pc.hand_id
+            LEFT JOIN player_returned pr ON pi.hand_id = pr.hand_id
+        )
+        SELECT hand_id, net_profit FROM player_pnl
+        '''
+        df_pnl = pd.read_sql_query(query, self.conn, params=(hero_id, hero_id, hero_id))
+
+        merged = pd.merge(hero_lines, df_pnl, on='hand_id', how='inner')
+        if merged.empty:
+            return pd.DataFrame()
+
+        # Group by action line to find most and least profitable
+        agg = merged.groupby('action_line').agg(
+            occurrences=('hand_id', 'count'),
+            total_pnl=('net_profit', 'sum'),
+            avg_pnl=('net_profit', 'mean')
+        ).reset_index()
+
+        return agg.sort_values('total_pnl', ascending=False)
+
