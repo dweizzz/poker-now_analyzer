@@ -52,7 +52,19 @@ if not priors_df.empty:
     priors_df = priors_df[priors_df['total_hands'] >= 50]
 
 st.sidebar.header("Navigation")
-view_mode = st.sidebar.radio("Select View", ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard", "My Leaks (Dan)"])
+
+show_leaks = os.environ.get("SHOW_LEAKS", "").lower() in ("true", "1", "yes")
+try:
+    if "SHOW_LEAKS" in st.secrets and st.secrets["SHOW_LEAKS"]:
+        show_leaks = True
+except Exception:
+    pass
+
+views = ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard"]
+if show_leaks:
+    views.append("My Leaks (Dan)")
+
+view_mode = st.sidebar.radio("Select View", views)
 
 if view_mode == "Exploit Dashboard":
     st.header("Opponent Intelligence & Exploit Dashboard")
