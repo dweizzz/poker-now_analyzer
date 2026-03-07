@@ -60,11 +60,18 @@ try:
 except Exception:
     pass
 
-views = ["Exploit Dashboard", "Player Profile", "Net PnL Leaderboard"]
+views = ["Exploit Dashboard", "3-Bet Analysis", "Line Inspector", "Player Profile", "Net PnL Leaderboard"]
 if show_leaks:
     views.append("My Leaks (Dan)")
 
-view_mode = st.sidebar.radio("Select View", views)
+if 'view_mode' not in st.session_state:
+    st.session_state.view_mode = views[0]
+
+view_mode_index = views.index(st.session_state.view_mode) if st.session_state.view_mode in views else 0
+
+st.sidebar.radio("Select View", views, index=view_mode_index, key='view_mode_radio', on_change=lambda: st.session_state.update(view_mode=st.session_state.view_mode_radio))
+
+view_mode = st.session_state.view_mode
 
 if view_mode == "Exploit Dashboard":
     st.header("Opponent Intelligence & Exploit Dashboard")
@@ -224,6 +231,10 @@ if view_mode == "Exploit Dashboard":
                 # Sizing Heatmap
                 st.markdown("### Sizing vs. Strength Correlation")
                 if not sizing_groups.empty:
+                    ordered = ['Overbet (>120%)', 'Large (80-120%)', 'Medium (40-80%)', 'Small (<40%)']
+                    actual_ordered = [o for o in ordered if o in sizing_groups.index]
+                    if actual_ordered:
+                        sizing_groups = sizing_groups.reindex(actual_ordered)
                     fig_sz, ax_sz = plt.subplots(figsize=(8, 4))
                     sns.heatmap(sizing_groups, annot=True, fmt=".0f", cmap="Reds", ax=ax_sz)
                     ax_sz.set_xlabel("Strength Tier (0=Air, 4=Nuts)")
@@ -258,76 +269,373 @@ if view_mode == "Exploit Dashboard":
                     else:
                         st.write("None found.")
 
-                # Verification String
-                if not tb.empty:
-                    most_common_texture = tb['texture_tags'].mode().iloc[0] if not tb['texture_tags'].mode().empty else 'Dry'
-                    most_common_size = tb['sizing_bucket'].mode().iloc[0] if not tb['sizing_bucket'].mode().empty else 'Unknown'
-                    st.info(f"**Verification Check:** In this pool, players triple-barreling on **{most_common_texture}** boards with **{most_common_size}** bets show up with Air **{freq:.1f}%** of the time.")
 
-                # Full Lines Table
-                st.divider()
-                st.markdown("### All Action Lines (Showdown Analyzed)")
-                showdowns = df_lines.dropna(subset=['strength_tier'])
-                if not showdowns.empty:
-                    agg = showdowns.groupby('action_line').agg(
-                        total_showdowns=('strength_tier', 'count'),
-                        bluffs=('strength_tier', lambda x: (x <= 1).sum()),
-                        wins=('strength_tier', lambda x: (x >= 2).sum())
-                    ).reset_index()
-                    agg['bluff_freq'] = (agg['bluffs'] / agg['total_showdowns']) * 100
-                    agg['wsd_pct'] = (agg['wins'] / agg['total_showdowns']) * 100
-                    agg = agg.sort_values('total_showdowns', ascending=False)
-
-                    st.dataframe(
-                        agg.style.format({'bluff_freq':'{:.1f}%', 'wsd_pct':'{:.1f}%'})
-                                 .background_gradient(subset=["bluff_freq"], cmap="Reds")
-                                 .background_gradient(subset=["wsd_pct"], cmap="Greens"),
-                        use_container_width=True, hide_index=True
-                    )
-                else:
-                    st.write("No showdown data available for lines.")
-
-                # Example Lines Engine
-                st.markdown("### Example Lines Inspector")
-                st.write("View individual instances of an action line to study the exact boards and hand strengths.")
-                unique_lines = df_lines['action_line'].unique().tolist()
-                selected_line = st.selectbox("Select Action Line:", sorted(unique_lines))
-
-                if selected_line:
-                    examples = df_lines[(df_lines['action_line'] == selected_line) & (df_lines['strength_tier'].notna())]
-                    if not examples.empty:
-                        # Map strength tier back to text for readability
-                        tier_map = {0: 'Air (High Card)', 1: 'Weak (Pair)', 2: 'Medium (Top/Two Pair)', 3: 'Strong (Set/Str/Fl)', 4: 'Nuts (FH+)'}
-                        examples['Hand Strength'] = examples['strength_tier'].map(tier_map)
-
-                        display_examples = examples[['hand_id', 'display_name', 'position', 'sizing_bucket', 'texture_tags', 'Hand Strength']]
-                        display_examples.columns = ['Hand ID', 'Player', 'Position', 'Final Sizing', 'Board Textures', 'Hand Strength']
-                        st.dataframe(display_examples, use_container_width=True, hide_index=True)
-
-                        st.markdown("#### Full Hand Log")
-                        selected_hand = st.selectbox("Select Hand to inspect:", examples['hand_id'].unique())
-                        if selected_hand:
-                            events_df = engine.get_hand_events(selected_hand)
-                            if not events_df.empty:
-                                if 'position' in events_df.columns:
-                                    display_log = events_df[['stage', 'position', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
-                                    display_log.columns = ['Stage', 'Pos', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
-                                else:
-                                    display_log = events_df[['stage', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
-                                    display_log.columns = ['Stage', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
-
-                                # Estimate height to eliminate vertical scrollbar (approx 35px per row + 40px header)
-                                optimal_height = len(display_log) * 35 + 40
-                                st.dataframe(display_log, use_container_width=True, hide_index=True, height=optimal_height)
-
-                    else:
-                        st.info("No showdown examples recorded for this line yet.")
 
             else:
                 st.info("No action line data available.")
 
     else:
         st.info("No sufficient data for Visual Analytics (requires >100 hands per player).")
+
+elif view_mode == "Line Inspector":
+    st.header("Action Lines Inspector")
+    st.info("Study detailed data on all player action lines and jump into specific example hands.")
+
+    with st.spinner("Analyzing Action Lines..."):
+        from analytics import LineExploitEngine
+        engine = LineExploitEngine('pokernow.db')
+        df_lines = engine.build_action_lines()
+
+        if not df_lines.empty:
+            st.markdown("### All Action Lines")
+            agg = df_lines.groupby('action_line').agg(
+                total_hands=('hand_id', 'count'),
+                total_showdowns=('strength_tier', lambda x: x.notna().sum()),
+                bluffs=('strength_tier', lambda x: (x <= 1).sum()),
+                wins=('strength_tier', lambda x: (x >= 2).sum())
+            ).reset_index()
+            agg['bluff_freq'] = agg.apply(lambda r: (r['bluffs'] / r['total_showdowns']) * 100 if r['total_showdowns'] > 0 else float('nan'), axis=1)
+            agg['wsd_pct'] = agg.apply(lambda r: (r['wins'] / r['total_showdowns']) * 100 if r['total_showdowns'] > 0 else float('nan'), axis=1)
+            agg = agg.sort_values('total_hands', ascending=False)
+
+            st.dataframe(
+                agg.style.format({'bluff_freq':'{:.1f}%', 'wsd_pct':'{:.1f}%', 'total_hands': '{:.0f}', 'total_showdowns': '{:.0f}'})
+                         .background_gradient(subset=["bluff_freq"], cmap="Reds")
+                         .background_gradient(subset=["wsd_pct"], cmap="Greens"),
+                use_container_width=True, hide_index=True
+            )
+
+            # If jumping from another tab (e.g. 3-Bet Analysis), show the targeted hand immediately
+            if 'target_hand_id' in st.session_state and st.session_state.target_hand_id:
+                target_hand = st.session_state.target_hand_id
+                del st.session_state.target_hand_id
+                st.markdown(f"### 🎯 Targeted Hand: `{target_hand}`")
+                events_df = engine.get_hand_events(target_hand)
+                if not events_df.empty:
+                    if 'position' in events_df.columns:
+                        display_log = events_df[['stage', 'position', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                        display_log.columns = ['Stage', 'Pos', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+                    else:
+                        display_log = events_df[['stage', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                        display_log.columns = ['Stage', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+                    optimal_height = len(display_log) * 35 + 40
+                    st.dataframe(display_log, use_container_width=True, hide_index=True, height=optimal_height)
+                else:
+                    st.warning(f"No events found for hand {target_hand}.")
+                st.divider()
+
+            st.markdown("### Example Lines Inspector")
+            st.write("View individual instances of an action line to study the exact boards and hand strengths.")
+            unique_lines = df_lines['action_line'].unique().tolist()
+
+            selected_line = st.selectbox("Select Action Line:", sorted(unique_lines))
+
+            if selected_line:
+                examples = df_lines[df_lines['action_line'] == selected_line]
+                if not examples.empty:
+                    tier_map = {0: 'Air (High Card)', 1: 'Weak (Pair)', 2: 'Medium (Top/Two Pair)', 3: 'Strong (Set/Str/Fl)', 4: 'Nuts (FH+)'}
+                    examples_copy = examples.copy()
+                    examples_copy['Hand Strength'] = examples_copy['strength_tier'].map(tier_map).fillna('No Showdown')
+
+                    display_examples = examples_copy[['hand_id', 'display_name', 'position', 'sizing_bucket', 'texture_tags', 'Hand Strength']]
+                    display_examples.columns = ['Hand ID', 'Player', 'Position', 'Final Sizing', 'Board Textures', 'Hand Strength']
+                    st.dataframe(display_examples, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No examples recorded for this line yet.")
+
+            st.markdown("#### Full Hand Log")
+
+            all_hands = df_lines['hand_id'].unique().tolist()
+            selected_hand = st.selectbox("Select Hand to inspect:", all_hands, key='inspect_hand_select')
+            if selected_hand:
+                events_df = engine.get_hand_events(selected_hand)
+                if not events_df.empty:
+                    if 'position' in events_df.columns:
+                        display_log = events_df[['stage', 'position', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                        display_log.columns = ['Stage', 'Pos', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+                    else:
+                        display_log = events_df[['stage', 'actor', 'action', 'amount', 'pot_size', 'board_cards', 'details']]
+                        display_log.columns = ['Stage', 'Player', 'Action', 'Amount', 'Pot', 'Board', 'Details']
+
+                    optimal_height = len(display_log) * 35 + 40
+                    st.dataframe(display_log, use_container_width=True, hide_index=True, height=optimal_height)
+        else:
+            st.info("No action line data available.")
+
+elif view_mode == "3-Bet Analysis":
+    st.header("3-Bet Analysis Dashboard")
+
+
+    with st.spinner("Analyzing 3-Bet Action..."):
+        from analytics import LineExploitEngine
+        engine = LineExploitEngine('pokernow.db')
+        df_lines = engine.build_action_lines()
+
+        if not df_lines.empty:
+            st.markdown("### 3-Bet Pots vs Single Raised Pots (SRP)")
+            stats_3b = engine.get_3bet_vs_srp_stats(df_lines)
+
+            col_3b1, col_3b2, col_3b3 = st.columns(3)
+
+            with col_3b1:
+                st.markdown("#### Bluff Frequencies")
+                st.metric("SRP Bluff %", f"{stats_3b['srp_bluff_pct']:.1f}%", help=f"Based on {stats_3b['srp_count']} showdowns")
+                st.metric("3-Bet Pot Bluff %", f"{stats_3b['tb_bluff_pct']:.1f}%", help=f"Based on {stats_3b['tb_count']} showdowns")
+
+            with col_3b2:
+                st.markdown("#### 3-Bet Pot Post-Flop Raises")
+                st.write("When a player raises post-flop in a 3-bet pot:")
+                st.metric("Nuts / Premium %", f"{stats_3b['tb_pf_raise_strong_pct']:.1f}%", help=f"Based on {stats_3b['tb_pf_raise_count']} instances")
+                st.metric("Air / Bluff %", f"{stats_3b['tb_pf_raise_air_pct']:.1f}%")
+
+            with col_3b3:
+                st.markdown("#### 3-Bettor Success")
+                st.metric("3-Bettor Win Rate", f"{stats_3b['tb_win_pct']:.1f}%", help=f"Percentage of time the 3-bettor wins the pot (out of {stats_3b['tb_total_hands']} hands)")
+
+            st.divider()
+            st.markdown("### Preflop 3-Bet Calling Ranges")
+            pf_stats = engine.get_3bet_preflop_stats()
+            if not pf_stats.empty:
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("#### Calling Ranges")
+                    cr = pf_stats.groupby('hand_combo').size().reset_index(name='count').sort_values('count', ascending=False)
+                    st.dataframe(cr, use_container_width=True, hide_index=True)
+
+                with col2:
+                    st.markdown("#### By Position")
+                    pr = pf_stats.groupby('position').size().reset_index(name='count').sort_values('count', ascending=False)
+                    st.dataframe(pr, use_container_width=True, hide_index=True)
+
+                st.markdown("#### Cold Callers (Only Action = Call 3bet)")
+                cold = pf_stats[pf_stats['is_cold_call'] == True]
+                if not cold.empty:
+                    cold_df = cold[['display_name', 'position', 'hand_combo']].rename(columns={'display_name':'Player', 'position':'Pos', 'hand_combo':'Hand'})
+                    st.dataframe(cold_df, use_container_width=True, hide_index=True)
+                else:
+                    st.write("No preflop cold calls of 3-bets found.")
+            else:
+                 st.info("No preflop 3-bets found.")
+
+            st.divider()
+            st.markdown("### Postflop Sizings in 3-Bet Pots")
+            post_sizings = engine.get_3bet_postflop_sizings(df_lines)
+            if not post_sizings.empty:
+                col_sz1, col_sz2 = st.columns(2)
+                with col_sz1:
+                    st.markdown("#### Overall Postflop Sizings")
+                    sz_agg = post_sizings.groupby('sizing_bucket').size().reset_index(name='count').sort_values('count', ascending=False)
+                    st.dataframe(sz_agg, use_container_width=True, hide_index=True)
+                with col_sz2:
+                     st.markdown("#### Sizings by Street")
+                     sz_st = post_sizings.groupby(['stage', 'sizing_bucket']).size().unstack(fill_value=0)
+                     st.dataframe(sz_st, use_container_width=True)
+
+                st.markdown("#### Inspect Specific Postflop 3-Bet Sizing")
+                unique_sz = post_sizings['sizing_bucket'].unique().tolist()
+                selected_sz = st.selectbox("Select Sizing to Inspect:", sorted(unique_sz), key='3b_sz_select')
+                if selected_sz:
+                     sz_examples = post_sizings[post_sizings['sizing_bucket'] == selected_sz]
+                     st.dataframe(sz_examples[['hand_id', 'display_name', 'stage', 'action', 'amount', 'pot_size']], use_container_width=True, hide_index=True)
+
+                     st.markdown("##### Full Hand Log")
+                     sel_h = st.selectbox("Select Hand to inspect:", sz_examples['hand_id'].unique(), key='3b_hand_select')
+                     if sel_h:
+                         def _go_to_inspector(hand_id):
+                             st.session_state.target_hand_id = hand_id
+                             st.session_state.view_mode = "Line Inspector"
+                             st.session_state.view_mode_radio = "Line Inspector"
+
+                         st.button("Inspect Hand in Line Inspector", type="primary",
+                                   on_click=_go_to_inspector, args=(sel_h,))
+            else:
+                st.info("No postflop actions in 3-bet pots found.")
+
+            # ---- Visual Analysis Section ----
+            st.divider()
+            st.markdown("### 📊 Positional 3-Bet Frequency Trellis")
+            st.caption("Each panel shows how often each hand combo is 3-bet from that position. Brighter = higher frequency.")
+
+            trellis_data = engine.get_3bet_frequency_by_position_and_hand()
+            if not trellis_data.empty:
+                ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2']
+                positions = ['BTN', 'CO', 'HJ', 'SB', 'BB']
+                available_positions = [p for p in positions if p in trellis_data['position'].unique()]
+
+                if available_positions:
+                    vmax_val = max(trellis_data['three_bet_freq'].max(), 1)
+
+                    for pos in available_positions:
+                        pos_data = trellis_data[trellis_data['position'] == pos]
+
+                        # Build 13x13 matrix
+                        freq_matrix = pd.DataFrame(np.nan, index=ranks, columns=ranks)
+                        annot_matrix = pd.DataFrame("", index=ranks, columns=ranks)
+
+                        for _, row in pos_data.iterrows():
+                            combo = row['hand_combo']
+                            freq = row['three_bet_freq']
+                            if len(combo) == 2:  # Pocket pair
+                                r1 = combo[0]
+                                if r1 in ranks:
+                                    freq_matrix.loc[r1, r1] = freq
+                                    annot_matrix.loc[r1, r1] = f"{combo}\n{freq:.0f}%"
+                            elif len(combo) == 3:
+                                r1, r2, suit_type = combo[0], combo[1], combo[2]
+                                if r1 in ranks and r2 in ranks:
+                                    if suit_type == 's':
+                                        freq_matrix.loc[r1, r2] = freq
+                                        annot_matrix.loc[r1, r2] = f"{combo}\n{freq:.0f}%"
+                                    else:
+                                        freq_matrix.loc[r2, r1] = freq
+                                        annot_matrix.loc[r2, r1] = f"{combo}\n{freq:.0f}%"
+
+                        # Fill empty annotations with combo names
+                        for r in ranks:
+                            for c in ranks:
+                                if annot_matrix.loc[r, c] == "":
+                                    if r == c:
+                                        annot_matrix.loc[r, c] = f"{r}{c}"
+                                    elif ranks.index(r) < ranks.index(c):
+                                        annot_matrix.loc[r, c] = f"{r}{c}s"
+                                    else:
+                                        annot_matrix.loc[r, c] = f"{c}{r}o"
+
+                        fig_tr, ax = plt.subplots(figsize=(12, 10))
+                        sns.heatmap(freq_matrix.astype(float), annot=annot_matrix, fmt="", cmap="YlOrRd",
+                                    vmin=0, vmax=vmax_val,
+                                    cbar=True, ax=ax, linewidths=0.3, linecolor='#ddd',
+                                    annot_kws={"size": 8}, square=True)
+                        ax.set_title(f"{pos}", fontsize=16, fontweight='bold')
+                        ax.xaxis.tick_top()
+                        ax.xaxis.set_label_position('top')
+                        ax.tick_params(axis='both', labelsize=9)
+                        plt.tight_layout()
+                        st.pyplot(fig_tr)
+                else:
+                    st.info("No positional 3-bet data available for primary positions.")
+            else:
+                st.info("No 3-bet frequency data available.")
+
+            st.divider()
+            st.markdown("### 📊 3-Bet Response by Raiser Position")
+            st.caption("When the original raiser faces a 3-bet, how do they respond? Segmented by raiser position.")
+
+            response_data = engine.get_3bet_response_by_position()
+            if not response_data.empty:
+                fig_resp, ax_resp = plt.subplots(figsize=(14, 8))
+                positions_order = ['BTN', 'CO', 'HJ', 'SB', 'BB', 'UTG', 'MP']
+                resp_sorted = response_data.copy()
+                resp_sorted['pos_order'] = resp_sorted['raiser_position'].apply(
+                    lambda x: positions_order.index(x) if x in positions_order else 99)
+                resp_sorted = resp_sorted.sort_values('pos_order')
+
+                x_labels = resp_sorted['raiser_position'].tolist()
+                x = np.arange(len(x_labels))
+                width = 0.6
+
+                fold_vals = resp_sorted['fold_pct'].values
+                call_vals = resp_sorted['call_pct'].values
+                fourbet_vals = resp_sorted['four_bet_pct'].values
+
+                bars_fold = ax_resp.bar(x, fold_vals, width, label='Fold', color='#e74c3c', alpha=0.9)
+                bars_call = ax_resp.bar(x, call_vals, width, bottom=fold_vals, label='Call', color='#3498db', alpha=0.9)
+                bars_4bet = ax_resp.bar(x, fourbet_vals, width, bottom=fold_vals + call_vals, label='4-Bet', color='#2ecc71', alpha=0.9)
+
+                # Add labels on segments
+                for i in range(len(x_labels)):
+                    total = resp_sorted.iloc[i]['total_faced']
+                    if fold_vals[i] > 8:
+                        ax_resp.text(x[i], fold_vals[i] / 2, f"{fold_vals[i]:.0f}%", ha='center', va='center', fontsize=8, color='white', fontweight='bold')
+                    if call_vals[i] > 8:
+                        ax_resp.text(x[i], fold_vals[i] + call_vals[i] / 2, f"{call_vals[i]:.0f}%", ha='center', va='center', fontsize=8, color='white', fontweight='bold')
+                    if fourbet_vals[i] > 8:
+                        ax_resp.text(x[i], fold_vals[i] + call_vals[i] + fourbet_vals[i] / 2, f"{fourbet_vals[i]:.0f}%", ha='center', va='center', fontsize=8, color='white', fontweight='bold')
+                    ax_resp.text(x[i], 102, f"n={int(total)}", ha='center', va='bottom', fontsize=7, color='gray')
+
+                ax_resp.set_xticks(x)
+                ax_resp.set_xticklabels(x_labels)
+                ax_resp.set_ylabel("Percentage")
+                ax_resp.set_title("Original Raiser's Response to 3-Bet")
+                ax_resp.legend(loc='upper right')
+                ax_resp.set_ylim(0, 115)
+
+                st.pyplot(fig_resp)
+            else:
+                st.info("No 3-bet response data available.")
+
+            st.divider()
+            st.markdown("### 🔴 Bluff Index Map (3-Bet Showdown Win Rate)")
+            st.caption("Win rate at showdown for hands used to 3-bet. Red = losing (over-bluffed spots). Green = winning (value hands).")
+
+            bluff_index_data = engine.get_3bet_bluff_index()
+            if not bluff_index_data.empty:
+                ranks = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2']
+                win_matrix = pd.DataFrame(np.nan, index=ranks, columns=ranks)
+                annot_matrix_bi = pd.DataFrame("", index=ranks, columns=ranks)
+
+                for _, row in bluff_index_data.iterrows():
+                    combo = row['hand_combo']
+                    win_pct = row['win_pct']
+                    count = int(row['showdown_count'])
+                    if len(combo) == 2:
+                        r1 = combo[0]
+                        if r1 in ranks:
+                            win_matrix.loc[r1, r1] = win_pct
+                            annot_matrix_bi.loc[r1, r1] = f"{combo}\n{win_pct:.0f}% ({count})"
+                    elif len(combo) == 3:
+                        r1, r2, suit_type = combo[0], combo[1], combo[2]
+                        if r1 in ranks and r2 in ranks:
+                            if suit_type == 's':
+                                win_matrix.loc[r1, r2] = win_pct
+                                annot_matrix_bi.loc[r1, r2] = f"{combo}\n{win_pct:.0f}% ({count})"
+                            else:
+                                win_matrix.loc[r2, r1] = win_pct
+                                annot_matrix_bi.loc[r2, r1] = f"{combo}\n{win_pct:.0f}% ({count})"
+
+                # Fill empty annotations
+                for r in ranks:
+                    for c in ranks:
+                        if annot_matrix_bi.loc[r, c] == "":
+                            if r == c:
+                                annot_matrix_bi.loc[r, c] = f"{r}{c}"
+                            elif ranks.index(r) < ranks.index(c):
+                                annot_matrix_bi.loc[r, c] = f"{r}{c}s"
+                            else:
+                                annot_matrix_bi.loc[r, c] = f"{c}{r}o"
+
+                fig_bi, ax_bi = plt.subplots(figsize=(16, 14))
+                sns.heatmap(win_matrix.astype(float), annot=annot_matrix_bi, fmt="", cmap="RdYlGn",
+                            vmin=0, vmax=100, center=50,
+                            cbar_kws={'label': 'Win Rate at Showdown (%)'}, ax=ax_bi,
+                            linewidths=0.5, linecolor='gray', annot_kws={"size": 7}, square=True)
+                ax_bi.xaxis.tick_top()
+                ax_bi.xaxis.set_label_position('top')
+                ax_bi.set_title("3-Bet Bluff Index: Win Rate at Showdown by Hand", pad=20, fontsize=14, fontweight='bold')
+                st.pyplot(fig_bi)
+
+                # Red Zone callout
+                red_zones = bluff_index_data[bluff_index_data['showdown_count'] >= 3].head(5)
+                if not red_zones.empty:
+                    st.markdown("#### 🚨 Red Zone Hands (Lowest WSD% with ≥3 Showdowns)")
+                    st.caption("These hands are being 3-bet but consistently lose at showdown — potential over-bluff spots.")
+                    rz_display = red_zones[['hand_combo', 'showdown_count', 'win_count', 'win_pct']].rename(columns={
+                        'hand_combo': 'Hand',
+                        'showdown_count': 'Showdowns',
+                        'win_count': 'Wins',
+                        'win_pct': 'Win %'
+                    })
+                    st.dataframe(
+                        rz_display.style.format({"Win %": "{:.1f}%"})
+                            .background_gradient(subset=["Win %"], cmap="RdYlGn", vmin=0, vmax=100),
+                        use_container_width=True, hide_index=True
+                    )
+            else:
+                st.info("No bluff index data available.")
+
+        else:
+             st.info("No action line data available.")
 
 elif view_mode == "Net PnL Leaderboard":
     st.header("Net PnL Leaderboard")

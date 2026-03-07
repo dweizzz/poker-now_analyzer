@@ -1041,3 +1041,495 @@ class LineExploitEngine:
 
         return agg.sort_values('total_pnl', ascending=False)
 
+    def get_3bet_vs_srp_stats(self, df_lines=None):
+        if df_lines is None:
+            df_lines = self.build_action_lines()
+
+        query = """
+        SELECT hand_id, SUM(CASE WHEN action = 'raise' THEN 1 ELSE 0 END) as pfr_count
+        FROM events
+        WHERE stage = 'Preflop'
+        GROUP BY hand_id
+        """
+        pfr_df = pd.read_sql_query(query, self.conn)
+
+        merged = df_lines.merge(pfr_df, on='hand_id', how='left')
+        merged['pfr_count'] = merged['pfr_count'].fillna(0)
+
+        srp_lines = merged[merged['pfr_count'] == 1]
+        three_bet_lines = merged[merged['pfr_count'] >= 2]
+
+        srp_showdowns = srp_lines.dropna(subset=['strength_tier'])
+        tb_showdowns = three_bet_lines.dropna(subset=['strength_tier'])
+
+        srp_bluff_pct = (srp_showdowns['strength_tier'] <= 1).mean() * 100 if len(srp_showdowns) > 0 else 0
+        tb_bluff_pct = (tb_showdowns['strength_tier'] <= 1).mean() * 100 if len(tb_showdowns) > 0 else 0
+
+        pf_raise_query = """
+        SELECT e.hand_id, e.player_id, MAX(CASE WHEN e.action IN ('raise', 'raise_to_amount') THEN 1 ELSE 0 END) as made_postflop_raise
+        FROM events e
+        WHERE e.stage IN ('Flop', 'Turn', 'River')
+        GROUP BY e.hand_id, e.player_id
+        """
+        pf_raises_df = pd.read_sql_query(pf_raise_query, self.conn)
+
+        tb_raises = tb_showdowns.merge(pf_raises_df, on=['hand_id', 'player_id'], how='left')
+        tb_pf_raisers = tb_raises[tb_raises['made_postflop_raise'] == 1]
+
+        if not tb_pf_raisers.empty:
+            tb_pf_raise_nuts_pct = (tb_pf_raisers['strength_tier'] >= 4).mean() * 100
+            tb_pf_raise_strong_pct = (tb_pf_raisers['strength_tier'] >= 3).mean() * 100
+            tb_pf_raise_air_pct = (tb_pf_raisers['strength_tier'] <= 0).mean() * 100
+            tb_pf_raise_count = len(tb_pf_raisers)
+        else:
+            tb_pf_raise_nuts_pct = 0
+            tb_pf_raise_strong_pct = 0
+            tb_pf_raise_air_pct = 0
+            tb_pf_raise_count = 0
+
+        # 3-bettor is the LAST player to raise preflop
+        tb_win_sql = """
+        WITH pfrs AS (
+            SELECT hand_id, player_id,
+                   ROW_NUMBER() OVER(PARTITION BY hand_id ORDER BY id DESC) as rn
+            FROM events
+            WHERE stage = 'Preflop' AND action IN ('raise', 'raise_to_amount')
+        ),
+        last_pfrs AS (
+            SELECT hand_id, player_id as three_bettor_id
+            FROM pfrs
+            WHERE rn = 1
+        ),
+        hand_pfr_counts AS (
+            SELECT hand_id, COUNT(*) as pfr_count
+            FROM events
+            WHERE stage = 'Preflop' AND action IN ('raise', 'raise_to_amount')
+            GROUP BY hand_id
+        ),
+        tb_hands AS (
+            SELECT lp.hand_id, lp.three_bettor_id
+            FROM last_pfrs lp
+            JOIN hand_pfr_counts hc ON lp.hand_id = hc.hand_id
+            WHERE hc.pfr_count >= 2
+        ),
+        collections AS (
+            SELECT hand_id, player_id, SUM(amount) as collected
+            FROM events
+            WHERE action = 'collect'
+            GROUP BY hand_id, player_id
+        ),
+        returns AS (
+            SELECT hand_id, player_id, SUM(amount) as returned
+            FROM events
+            WHERE action = 'returned'
+            GROUP BY hand_id, player_id
+        )
+        SELECT th.hand_id,
+               CASE WHEN (c.collected IS NOT NULL AND c.collected > 0) OR (r.returned IS NOT NULL AND r.returned > 0) THEN 1 ELSE 0 END as three_bettor_won
+        FROM tb_hands th
+        LEFT JOIN collections c ON th.hand_id = c.hand_id AND th.three_bettor_id = c.player_id
+        LEFT JOIN returns r ON th.hand_id = r.hand_id AND th.three_bettor_id = r.player_id
+        """
+        tb_win_df = pd.read_sql_query(tb_win_sql, self.conn)
+        tb_win_pct = tb_win_df['three_bettor_won'].mean() * 100 if not tb_win_df.empty else 0
+        tb_win_count = len(tb_win_df)
+
+        return {
+            'srp_bluff_pct': srp_bluff_pct,
+            'srp_count': len(srp_showdowns),
+            'tb_bluff_pct': tb_bluff_pct,
+            'tb_count': len(tb_showdowns),
+            'tb_pf_raise_nuts_pct': tb_pf_raise_nuts_pct,
+            'tb_pf_raise_strong_pct': tb_pf_raise_strong_pct,
+            'tb_pf_raise_air_pct': tb_pf_raise_air_pct,
+            'tb_pf_raise_count': tb_pf_raise_count,
+            'tb_win_pct': tb_win_pct,
+            'tb_total_hands': tb_win_count
+        }
+
+    def get_3bet_preflop_stats(self):
+        query = """
+        SELECT e.hand_id, e.player_id, e.action, e.id as event_id, ph.hole_cards, p.player_name as display_name
+        FROM events e
+        LEFT JOIN player_hand_cards ph ON e.hand_id = ph.hand_id AND e.player_id = ph.player_id
+        LEFT JOIN (
+            SELECT player_id, player_name, ROW_NUMBER() OVER(PARTITION BY player_id ORDER BY COUNT(*) DESC) as rn
+            FROM players GROUP BY player_id, player_name
+        ) p ON e.player_id = p.player_id AND p.rn = 1
+        WHERE e.stage = 'Preflop' AND e.action IN ('raise', 'raise_to_amount', 'call')
+        ORDER BY e.hand_id, e.id
+        """
+        df = pd.read_sql_query(query, self.conn)
+
+        pos_query = """
+        WITH PlayerFirstAction AS (
+            SELECT hand_id, player_id, MIN(id) as first_action_id
+            FROM events
+            WHERE stage='Preflop' AND (action LIKE 'post_%' OR action IN ('fold','call','raise','check'))
+            GROUP BY hand_id, player_id
+        ),
+        RankedPlayers AS (
+            SELECT hand_id, player_id, RANK() OVER(PARTITION BY hand_id ORDER BY first_action_id ASC) as pos_rank,
+                   COUNT(*) OVER(PARTITION BY hand_id) as table_size
+            FROM PlayerFirstAction
+        )
+        SELECT hand_id, player_id, pos_rank, table_size FROM RankedPlayers
+        """
+        pos_df = pd.read_sql_query(pos_query, self.conn)
+        df = df.merge(pos_df, on=['hand_id', 'player_id'], how='left')
+        df['position'] = df.apply(lambda row: self._map_pos(row['pos_rank'], row['table_size']), axis=1)
+
+        calls = []
+        for hand_id, group in df.groupby('hand_id'):
+            raises = 0
+            vol_players = set()
+            for _, row in group.iterrows():
+                action = row['action']
+                pid = row['player_id']
+
+                if action in ['raise', 'raise_to_amount']:
+                    raises += 1
+                    vol_players.add(pid)
+                elif action == 'call':
+                    if raises >= 2:
+                        is_cold = pid not in vol_players
+                        calls.append({
+                            'hand_id': hand_id,
+                            'player_id': pid,
+                            'display_name': row['display_name'],
+                            'position': row['position'],
+                            'hole_cards': row['hole_cards'],
+                            'is_cold_call': is_cold
+                        })
+                    vol_players.add(pid)
+
+        res_df = pd.DataFrame(calls)
+        if res_df.empty: return res_df
+
+        def _normalize_cards(cards_str):
+            if pd.isna(cards_str) or not cards_str: return 'Unknown'
+            cards = cards_str.split(',')
+            if len(cards) != 2: return 'Unknown'
+            ranks, suits = [c[0] for c in cards], [c[1] for c in cards]
+            rank_order = {'A': 14, 'K': 13, 'Q': 12, 'J': 11, 'T': 10, '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2}
+            try:
+                r1, r2 = ranks[0], ranks[1]
+                if rank_order[r1] < rank_order[r2]:
+                    r1, r2 = r2, r1
+                    s1, s2 = suits[1], suits[0]
+                else:
+                    s1, s2 = suits[0], suits[1]
+                if r1 == r2: return f"{r1}{r2}"
+                return f"{r1}{r2}{'s' if s1 == s2 else 'o'}"
+            except:
+                return cards_str
+
+        res_df['hand_combo'] = res_df['hole_cards'].apply(_normalize_cards)
+        return res_df
+
+    def get_3bet_postflop_sizings(self, df_lines=None):
+        if df_lines is None:
+            df_lines = self.build_action_lines()
+
+        query = """
+        SELECT hand_id, SUM(CASE WHEN action IN ('raise', 'raise_to_amount') THEN 1 ELSE 0 END) as pfr_count
+        FROM events
+        WHERE stage = 'Preflop'
+        GROUP BY hand_id
+        """
+        pfr_df = pd.read_sql_query(query, self.conn)
+        tb_hands = pfr_df[pfr_df['pfr_count'] >= 2]['hand_id']
+
+        tb_hands_list = tuple(tb_hands.dropna().unique())
+        if not tb_hands_list: return pd.DataFrame()
+
+        events_query = """
+        SELECT e.id, e.hand_id, e.player_id, e.stage, e.action, e.amount, e.pot_size, p.player_name as display_name
+        FROM events e
+        LEFT JOIN (
+            SELECT player_id, player_name, ROW_NUMBER() OVER(PARTITION BY player_id ORDER BY COUNT(*) DESC) as rn
+            FROM players GROUP BY player_id, player_name
+        ) p ON e.player_id = p.player_id AND p.rn = 1
+        WHERE e.stage IN ('Flop', 'Turn', 'River') AND e.action IN ('bet', 'raise', 'raise_to_amount')
+        """
+        postflop_df = pd.read_sql_query(events_query, self.conn)
+        tb_postflop = postflop_df[postflop_df['hand_id'].isin(tb_hands_list)]
+
+        sizings = []
+        for _, row in tb_postflop.iterrows():
+            pot = row['pot_size']
+            amt = row['amount']
+            if not pot or pot <= 0: continue
+
+            pot_before = pot - amt
+            pct = (amt / pot_before) if pot_before > 0 else 1.5
+            sz = 'Overbet (>120%)'
+            if pct < 0.4: sz = 'Small (<40%)'
+            elif pct <= 0.8: sz = 'Medium (40-80%)'
+            elif pct <= 1.2: sz = 'Large (80-120%)'
+
+            sizings.append({
+                'hand_id': row['hand_id'],
+                'player_id': row['player_id'],
+                'display_name': row['display_name'],
+                'stage': row['stage'],
+                'action': row['action'],
+                'sizing_bucket': sz,
+                'amount': amt,
+                'pot_size': pot_before
+            })
+
+        return pd.DataFrame(sizings)
+
+    # ---------- 3-Bet Visual Analysis Methods ----------
+
+    @staticmethod
+    def _normalize_cards_static(cards_str):
+        """Normalize hole cards to standard combo notation (e.g. AKs, QJo, TT)."""
+        if pd.isna(cards_str) or not cards_str:
+            return 'Unknown'
+        cards = cards_str.split(',')
+        if len(cards) != 2:
+            return 'Unknown'
+        ranks = [c.strip()[0] for c in cards]
+        suits = [c.strip()[1] for c in cards]
+        rank_order = {'A': 14, 'K': 13, 'Q': 12, 'J': 11, 'T': 10,
+                      '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2}
+        try:
+            r1, r2 = ranks[0], ranks[1]
+            s1, s2 = suits[0], suits[1]
+            if rank_order.get(r1, 0) < rank_order.get(r2, 0):
+                r1, r2 = r2, r1
+                s1, s2 = s2, s1
+            if r1 == r2:
+                return f"{r1}{r2}"
+            return f"{r1}{r2}{'s' if s1 == s2 else 'o'}"
+        except Exception:
+            return 'Unknown'
+
+    def _get_position_query(self):
+        """Reusable CTE for positional ranking."""
+        return """
+        WITH PlayerFirstAction AS (
+            SELECT hand_id, player_id, MIN(id) as first_action_id
+            FROM events
+            WHERE stage='Preflop' AND (action LIKE 'post_%' OR action IN ('fold','call','raise','check'))
+            GROUP BY hand_id, player_id
+        ),
+        RankedPlayers AS (
+            SELECT hand_id, player_id,
+                   RANK() OVER(PARTITION BY hand_id ORDER BY first_action_id ASC) as pos_rank,
+                   COUNT(*) OVER(PARTITION BY hand_id) as table_size
+            FROM PlayerFirstAction
+        )
+        SELECT hand_id, player_id, pos_rank, table_size FROM RankedPlayers
+        """
+
+    def get_3bet_frequency_by_position_and_hand(self):
+        """Get 3-bet frequency per hand combo, grouped by the 3-bettor's position.
+
+        Returns a DataFrame with: position, hand_combo, three_bet_count, total_opportunities, three_bet_freq
+        """
+        # Step 1: Get all preflop actions with hole cards and positions
+        query = """
+        SELECT e.hand_id, e.player_id, e.action, e.id as event_id,
+               ph.hole_cards
+        FROM events e
+        LEFT JOIN player_hand_cards ph ON e.hand_id = ph.hand_id AND e.player_id = ph.player_id
+        WHERE e.stage = 'Preflop' AND e.action IN ('raise', 'raise_to_amount', 'call', 'fold')
+        ORDER BY e.hand_id, e.id
+        """
+        df = pd.read_sql_query(query, self.conn)
+
+        # Step 2: Get positions
+        pos_df = pd.read_sql_query(self._get_position_query(), self.conn)
+        df = df.merge(pos_df, on=['hand_id', 'player_id'], how='left')
+        df['position'] = df.apply(lambda row: self._map_pos(row['pos_rank'], row['table_size']), axis=1)
+
+        three_bets = []
+        opportunities = []
+
+        for hand_id, group in df.groupby('hand_id'):
+            raises = 0
+            for _, row in group.iterrows():
+                action = row['action']
+                pid = row['player_id']
+                pos = row['position']
+                cards = row['hole_cards']
+
+                if action in ['raise', 'raise_to_amount']:
+                    raises += 1
+                    if raises == 2:
+                        # This is a 3-bet
+                        combo = self._normalize_cards_static(cards)
+                        if combo != 'Unknown':
+                            three_bets.append({'position': pos, 'hand_combo': combo})
+                elif raises == 1 and action in ['call', 'fold']:
+                    # Player had the opportunity to 3-bet but didn't
+                    combo = self._normalize_cards_static(cards)
+                    if combo != 'Unknown':
+                        opportunities.append({'position': pos, 'hand_combo': combo})
+
+        # Add three-bets as opportunities too
+        for tb in three_bets:
+            opportunities.append(tb.copy())
+
+        if not three_bets:
+            return pd.DataFrame()
+
+        tb_df = pd.DataFrame(three_bets).groupby(['position', 'hand_combo']).size().reset_index(name='three_bet_count')
+        opp_df = pd.DataFrame(opportunities).groupby(['position', 'hand_combo']).size().reset_index(name='total_opportunities')
+
+        result = opp_df.merge(tb_df, on=['position', 'hand_combo'], how='left')
+        result['three_bet_count'] = result['three_bet_count'].fillna(0).astype(int)
+        result['three_bet_freq'] = (result['three_bet_count'] / result['total_opportunities'] * 100).round(1)
+
+        return result
+
+    def get_3bet_response_by_position(self):
+        """Get how the original raiser responds to a 3-bet, grouped by raiser position.
+
+        Returns a DataFrame with: raiser_position, fold_pct, call_pct, four_bet_pct, total_faced
+        """
+        query = """
+        SELECT e.hand_id, e.player_id, e.action, e.id as event_id
+        FROM events e
+        WHERE e.stage = 'Preflop' AND e.action IN ('raise', 'raise_to_amount', 'call', 'fold')
+        ORDER BY e.hand_id, e.id
+        """
+        df = pd.read_sql_query(query, self.conn)
+
+        pos_df = pd.read_sql_query(self._get_position_query(), self.conn)
+        df = df.merge(pos_df, on=['hand_id', 'player_id'], how='left')
+        df['position'] = df.apply(lambda row: self._map_pos(row['pos_rank'], row['table_size']), axis=1)
+
+        responses = []
+
+        for hand_id, group in df.groupby('hand_id'):
+            raises = 0
+            first_raiser_pid = None
+            first_raiser_pos = None
+
+            for _, row in group.iterrows():
+                action = row['action']
+                pid = row['player_id']
+                pos = row['position']
+
+                if action in ['raise', 'raise_to_amount']:
+                    raises += 1
+                    if raises == 1:
+                        first_raiser_pid = pid
+                        first_raiser_pos = pos
+                    elif raises == 2:
+                        # 3-bet happened — now look for original raiser's response
+                        pass
+                    elif raises == 3 and pid == first_raiser_pid:
+                        # Original raiser 4-bet
+                        responses.append({'raiser_position': first_raiser_pos, 'response': '4-Bet'})
+                elif raises >= 2 and pid == first_raiser_pid:
+                    # Original raiser acts after facing 3-bet
+                    if action == 'fold':
+                        responses.append({'raiser_position': first_raiser_pos, 'response': 'Fold'})
+                    elif action == 'call':
+                        responses.append({'raiser_position': first_raiser_pos, 'response': 'Call'})
+
+        if not responses:
+            return pd.DataFrame()
+
+        resp_df = pd.DataFrame(responses)
+        agg = resp_df.groupby(['raiser_position', 'response']).size().unstack(fill_value=0)
+
+        for col in ['Fold', 'Call', '4-Bet']:
+            if col not in agg.columns:
+                agg[col] = 0
+
+        agg['total_faced'] = agg.sum(axis=1)
+        agg['fold_pct'] = (agg['Fold'] / agg['total_faced'] * 100).round(1)
+        agg['call_pct'] = (agg['Call'] / agg['total_faced'] * 100).round(1)
+        agg['four_bet_pct'] = (agg['4-Bet'] / agg['total_faced'] * 100).round(1)
+
+        result = agg[['fold_pct', 'call_pct', 'four_bet_pct', 'total_faced']].reset_index()
+        result.columns = ['raiser_position', 'fold_pct', 'call_pct', 'four_bet_pct', 'total_faced']
+        return result.sort_values('total_faced', ascending=False)
+
+    def get_3bet_bluff_index(self):
+        """Get win rate at showdown for hands used to 3-bet (the 'Bluff Index').
+
+        Returns a DataFrame with: hand_combo, showdown_count, win_count, win_pct
+        """
+        import json
+
+        # Step 1: Identify the 3-bettor and their cards in each 3-bet hand
+        query = """
+        SELECT e.hand_id, e.player_id, e.action, e.id as event_id,
+               ph.hole_cards
+        FROM events e
+        LEFT JOIN player_hand_cards ph ON e.hand_id = ph.hand_id AND e.player_id = ph.player_id
+        WHERE e.stage = 'Preflop' AND e.action IN ('raise', 'raise_to_amount')
+        ORDER BY e.hand_id, e.id
+        """
+        df = pd.read_sql_query(query, self.conn)
+
+        three_bettors = {}  # hand_id -> (player_id, hole_cards)
+        for hand_id, group in df.groupby('hand_id'):
+            raises = list(group.itertuples(index=False))
+            if len(raises) >= 2:
+                # The second raiser is the 3-bettor
+                tb = raises[1]
+                three_bettors[hand_id] = (tb.player_id, tb.hole_cards)
+
+        if not three_bettors:
+            return pd.DataFrame()
+
+        # Step 2: Find showdown results — did the 3-bettor win?
+        tb_hand_ids = list(three_bettors.keys())
+
+        # Get collections for 3-bet hands
+        placeholders = ','.join(['?' for _ in tb_hand_ids])
+        collect_query = f"""
+        SELECT hand_id, player_id, SUM(amount) as collected
+        FROM events
+        WHERE action = 'collect' AND hand_id IN ({placeholders})
+        GROUP BY hand_id, player_id
+        """
+        collect_df = pd.read_sql_query(collect_query, self.conn, params=tb_hand_ids)
+
+        # Check which hands went to showdown
+        showdown_query = f"""
+        SELECT DISTINCT hand_id
+        FROM events
+        WHERE (action = 'show' OR stage = 'Showdown') AND hand_id IN ({placeholders})
+        """
+        showdown_df = pd.read_sql_query(showdown_query, self.conn, params=tb_hand_ids)
+        showdown_hands = set(showdown_df['hand_id'].tolist())
+
+        results = []
+        for hand_id, (pid, cards) in three_bettors.items():
+            if hand_id not in showdown_hands:
+                continue
+            combo = self._normalize_cards_static(cards)
+            if combo == 'Unknown':
+                continue
+
+            # Did 3-bettor win?
+            collected = collect_df[(collect_df['hand_id'] == hand_id) & (collect_df['player_id'] == pid)]
+            won = not collected.empty and collected.iloc[0]['collected'] > 0
+
+            results.append({
+                'hand_combo': combo,
+                'won': won
+            })
+
+        if not results:
+            return pd.DataFrame()
+
+        res_df = pd.DataFrame(results)
+        agg = res_df.groupby('hand_combo').agg(
+            showdown_count=('won', 'count'),
+            win_count=('won', 'sum')
+        ).reset_index()
+        agg['win_pct'] = (agg['win_count'] / agg['showdown_count'] * 100).round(1)
+
+        return agg.sort_values('win_pct', ascending=True)
+
+
